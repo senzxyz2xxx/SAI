@@ -13,20 +13,19 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = 1005357318281641994
 
-# ห้องที่บอทจะตอบ (ไม่ต้องใช้ prefix)
 ALLOWED_CHANNELS = [
     1518970044925739160,
-   1519823094816968867,
+    1519823094816968867,
 ]
+
+MODEL_NAME = "gemini-1.5-flash-latest"
 # ============================
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.0-flash")
+model = genai.GenerativeModel(MODEL_NAME)
 
-# เก็บประวัติแชทแยกต่อ channel
 chat_sessions = {}
 
-# เก็บสถิติการใช้งาน
 stats = {
     "total_requests": 0,
     "total_tokens_in": 0,
@@ -46,7 +45,10 @@ def get_chat(channel_id):
 
 
 def count_tokens(text):
-    return model.count_tokens(text).total_tokens
+    try:
+        return model.count_tokens(text).total_tokens
+    except:
+        return len(text) // 4  # fallback estimate
 
 
 # =======================
@@ -92,7 +94,7 @@ def home():
 
         <div class="card">
             <div class="label">Model</div>
-            <div class="value">Gemini 1.5 Flash (Free Tier)</div>
+            <div class="value">Gemini 1.5 Flash Latest (Free Tier)</div>
         </div>
 
         <div class="grid">
@@ -122,7 +124,7 @@ def home():
         </div>
 
         <div class="card">
-            <div class="label">⚡ Free Tier Limits (Gemini 1.5 Flash)</div>
+            <div class="label">⚡ Free Tier Limits (Gemini 1.5 Flash Latest)</div>
             <p>• 15 requests/นาที</p>
             <p>• 1,500 requests/วัน</p>
             <p>• 1,000,000 tokens/วัน</p>
@@ -151,11 +153,9 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    # ไม่ตอบตัวเอง
     if message.author.bot:
         return
 
-    # คำสั่งสำหรับ owner เท่านั้น
     if message.author.id == OWNER_ID:
         if message.content == "!reset":
             chat_sessions.pop(message.channel.id, None)
@@ -174,7 +174,6 @@ async def on_message(message):
             )
             return
 
-    # ตรวจสอบว่าอยู่ในห้องที่อนุญาต
     if message.channel.id not in ALLOWED_CHANNELS:
         return
 
@@ -192,7 +191,6 @@ async def on_message(message):
             output_tokens = count_tokens(reply)
             total_used = input_tokens + output_tokens
 
-            # อัปเดตสถิติ
             stats["total_requests"] += 1
             stats["total_tokens_in"] += input_tokens
             stats["total_tokens_out"] += output_tokens
