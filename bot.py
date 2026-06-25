@@ -18,7 +18,7 @@ ALLOWED_CHANNELS = [
     1519823094816968867,
 ]
 
-MODEL_NAME = "gemini-1.5-flash-latest"
+MODEL_NAME = "gemini-3.1-flash-lite"
 # ============================
 
 genai.configure(api_key=GEMINI_API_KEY)
@@ -94,7 +94,7 @@ def home():
 
         <div class="card">
             <div class="label">Model</div>
-            <div class="value">Gemini 1.5 Flash Latest (Free Tier)</div>
+            <div class="value">Gemini 3.1 Flash Lite (Free Tier)</div>
         </div>
 
         <div class="grid">
@@ -124,7 +124,7 @@ def home():
         </div>
 
         <div class="card">
-            <div class="label">⚡ Free Tier Limits (Gemini 1.5 Flash Latest)</div>
+            <div class="label">⚡ Free Tier Limits (Gemini 3.1 Flash Lite)</div>
             <p>• 15 requests/นาที</p>
             <p>• 1,500 requests/วัน</p>
             <p>• 1,000,000 tokens/วัน</p>
