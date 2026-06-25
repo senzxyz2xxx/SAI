@@ -48,7 +48,7 @@ def count_tokens(text):
     try:
         return model.count_tokens(text).total_tokens
     except:
-        return len(text) // 4  # fallback estimate
+        return len(text) // 4
 
 
 # =======================
@@ -65,74 +65,290 @@ def home():
     total_tokens = stats["total_tokens_in"] + stats["total_tokens_out"]
     daily_token_limit = 1_000_000
     daily_req_limit = 1_500
-    token_percent = round((total_tokens / daily_token_limit) * 100, 2)
-    req_percent = round((stats["total_requests"] / daily_req_limit) * 100, 2)
+    token_percent = min(round((total_tokens / daily_token_limit) * 100, 2), 100)
+    req_percent = min(round((stats["total_requests"] / daily_req_limit) * 100, 2), 100)
 
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="th">
-    <head>
-        <meta charset="UTF-8">
-        <meta http-equiv="refresh" content="30">
-        <title>Discord AI Bot Status</title>
-        <style>
-            body {{ font-family: 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; padding: 30px; }}
-            h1 {{ color: #00d4ff; }}
-            .card {{ background: #16213e; border-radius: 12px; padding: 20px; margin: 16px 0; }}
-            .label {{ color: #aaa; font-size: 0.85em; }}
-            .value {{ font-size: 1.4em; font-weight: bold; color: #00d4ff; }}
-            .bar-bg {{ background: #0f3460; border-radius: 8px; height: 14px; margin-top: 6px; }}
-            .bar {{ height: 14px; border-radius: 8px; background: linear-gradient(90deg, #00d4ff, #7b2ff7); }}
-            .green {{ color: #00ff88; }}
-            .yellow {{ color: #ffd700; }}
-            .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
-        </style>
-    </head>
-    <body>
-        <h1>🤖 Discord AI Bot</h1>
-        <p class="green">● Online — Uptime: {hours}h {minutes}m {seconds}s</p>
+    req_color = "#00ff88" if req_percent < 70 else "#ffd700" if req_percent < 90 else "#ff4444"
+    tok_color = "#00ff88" if token_percent < 70 else "#ffd700" if token_percent < 90 else "#ff4444"
 
+    html = f"""<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="refresh" content="30">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SAI — Bot Status</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: 'Inter', sans-serif;
+            background: #0d0d14;
+            color: #e2e8f0;
+            min-height: 100vh;
+            padding: 32px 20px;
+        }}
+        .container {{ max-width: 720px; margin: 0 auto; }}
+
+        /* HEADER */
+        .header {{
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 32px;
+        }}
+        .avatar {{
+            width: 56px; height: 56px;
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            border-radius: 16px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 28px;
+        }}
+        .header-text h1 {{
+            font-size: 1.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #a78bfa, #60a5fa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }}
+        .header-text p {{ color: #64748b; font-size: 0.85rem; margin-top: 2px; }}
+
+        /* STATUS BADGE */
+        .status-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: #0f2d1f;
+            border: 1px solid #166534;
+            color: #4ade80;
+            padding: 4px 12px;
+            border-radius: 999px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            margin-bottom: 24px;
+        }}
+        .dot {{
+            width: 7px; height: 7px;
+            background: #4ade80;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }}
+        @keyframes pulse {{
+            0%, 100% {{ opacity: 1; }}
+            50% {{ opacity: 0.4; }}
+        }}
+
+        /* CARDS */
+        .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }}
+        .card {{
+            background: #13131f;
+            border: 1px solid #1e1e30;
+            border-radius: 16px;
+            padding: 20px;
+            transition: border-color 0.2s;
+        }}
+        .card:hover {{ border-color: #6366f1; }}
+        .card-full {{ grid-column: span 2; }}
+        .card-label {{
+            font-size: 0.72rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #475569;
+            margin-bottom: 8px;
+        }}
+        .card-value {{
+            font-size: 1.6rem;
+            font-weight: 700;
+            color: #f1f5f9;
+            line-height: 1;
+        }}
+        .card-sub {{
+            font-size: 0.78rem;
+            color: #475569;
+            margin-top: 4px;
+        }}
+        .card-icon {{ font-size: 1.1rem; margin-bottom: 6px; }}
+
+        /* PROGRESS BAR */
+        .bar-wrap {{ margin-top: 12px; }}
+        .bar-header {{
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.75rem;
+            color: #64748b;
+            margin-bottom: 6px;
+        }}
+        .bar-bg {{
+            background: #1e1e30;
+            border-radius: 999px;
+            height: 8px;
+            overflow: hidden;
+        }}
+        .bar-fill {{
+            height: 100%;
+            border-radius: 999px;
+            transition: width 0.5s ease;
+        }}
+
+        /* MODEL CARD */
+        .model-card {{
+            background: linear-gradient(135deg, #1a1a2e, #16162a);
+            border: 1px solid #312e6b;
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 14px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }}
+        .model-icon {{
+            width: 44px; height: 44px;
+            background: linear-gradient(135deg, #4f46e5, #7c3aed);
+            border-radius: 12px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 22px;
+            flex-shrink: 0;
+        }}
+        .model-name {{ font-weight: 700; font-size: 1rem; color: #c4b5fd; }}
+        .model-desc {{ font-size: 0.78rem; color: #64748b; margin-top: 2px; }}
+        .model-badge {{
+            margin-left: auto;
+            background: #1e1b4b;
+            color: #818cf8;
+            border: 1px solid #3730a3;
+            padding: 3px 10px;
+            border-radius: 999px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            white-space: nowrap;
+        }}
+
+        /* LIMITS TABLE */
+        .limits-card {{
+            background: #13131f;
+            border: 1px solid #1e1e30;
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 14px;
+        }}
+        .limits-title {{
+            font-size: 0.72rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #475569;
+            margin-bottom: 14px;
+        }}
+        .limit-row {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid #1e1e30;
+        }}
+        .limit-row:last-child {{ border-bottom: none; }}
+        .limit-label {{ font-size: 0.85rem; color: #94a3b8; }}
+        .limit-val {{ font-size: 0.85rem; font-weight: 600; color: #e2e8f0; }}
+
+        /* FOOTER */
+        .footer {{ text-align: center; color: #334155; font-size: 0.72rem; margin-top: 24px; }}
+
+        @media (max-width: 480px) {{
+            .grid {{ grid-template-columns: 1fr; }}
+            .card-full {{ grid-column: span 1; }}
+        }}
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <div class="header">
+        <div class="avatar">🤖</div>
+        <div class="header-text">
+            <h1>SAI Bot</h1>
+            <p>Discord AI Assistant</p>
+        </div>
+    </div>
+
+    <div class="status-badge">
+        <div class="dot"></div>
+        Online — Uptime {hours}h {minutes}m {seconds}s
+    </div>
+
+    <div class="model-card">
+        <div class="model-icon">✨</div>
+        <div>
+            <div class="model-name">{MODEL_NAME}</div>
+            <div class="model-desc">Google Gemini — Fast & Efficient</div>
+        </div>
+        <div class="model-badge">Free Tier</div>
+    </div>
+
+    <div class="grid">
         <div class="card">
-            <div class="label">Model</div>
-            <div class="value">Gemini 3.1 Flash Lite (Free Tier)</div>
-        </div>
-
-        <div class="grid">
-            <div class="card">
-                <div class="label">📨 Requests วันนี้</div>
-                <div class="value">{stats["total_requests"]} / {daily_req_limit}</div>
-                <div class="bar-bg"><div class="bar" style="width:{min(req_percent,100)}%"></div></div>
-                <div class="label">{req_percent}% ของ limit</div>
-            </div>
-            <div class="card">
-                <div class="label">🪙 Tokens วันนี้</div>
-                <div class="value">{total_tokens:,} / {daily_token_limit:,}</div>
-                <div class="bar-bg"><div class="bar" style="width:{min(token_percent,100)}%"></div></div>
-                <div class="label">{token_percent}% ของ limit</div>
+            <div class="card-icon">📨</div>
+            <div class="card-label">Requests Today</div>
+            <div class="card-value">{stats["total_requests"]}</div>
+            <div class="card-sub">จาก {daily_req_limit:,} req/วัน</div>
+            <div class="bar-wrap">
+                <div class="bar-header"><span>{req_percent}% used</span><span>{daily_req_limit - stats["total_requests"]:,} เหลือ</span></div>
+                <div class="bar-bg"><div class="bar-fill" style="width:{req_percent}%;background:{req_color}"></div></div>
             </div>
         </div>
-
-        <div class="grid">
-            <div class="card">
-                <div class="label">📥 Tokens Input</div>
-                <div class="value">{stats["total_tokens_in"]:,}</div>
-            </div>
-            <div class="card">
-                <div class="label">📤 Tokens Output</div>
-                <div class="value">{stats["total_tokens_out"]:,}</div>
-            </div>
-        </div>
-
         <div class="card">
-            <div class="label">⚡ Free Tier Limits (Gemini 3.1 Flash Lite)</div>
-            <p>• 15 requests/นาที</p>
-            <p>• 1,500 requests/วัน</p>
-            <p>• 1,000,000 tokens/วัน</p>
-            <p class="yellow">⚠️ หน้านี้รีเฟรชทุก 30 วินาที — สถิติรีเซตเมื่อ restart บอท</p>
+            <div class="card-icon">🪙</div>
+            <div class="card-label">Tokens Today</div>
+            <div class="card-value">{total_tokens:,}</div>
+            <div class="card-sub">จาก {daily_token_limit:,} tokens/วัน</div>
+            <div class="bar-wrap">
+                <div class="bar-header"><span>{token_percent}% used</span><span>{daily_token_limit - total_tokens:,} เหลือ</span></div>
+                <div class="bar-bg"><div class="bar-fill" style="width:{token_percent}%;background:{tok_color}"></div></div>
+            </div>
         </div>
-    </body>
-    </html>
-    """
+        <div class="card">
+            <div class="card-icon">📥</div>
+            <div class="card-label">Input Tokens</div>
+            <div class="card-value">{stats["total_tokens_in"]:,}</div>
+            <div class="card-sub">จากข้อความผู้ใช้</div>
+        </div>
+        <div class="card">
+            <div class="card-icon">📤</div>
+            <div class="card-label">Output Tokens</div>
+            <div class="card-value">{stats["total_tokens_out"]:,}</div>
+            <div class="card-sub">จากคำตอบบอท</div>
+        </div>
+    </div>
+
+    <div class="limits-card">
+        <div class="limits-title">⚡ Free Tier Rate Limits</div>
+        <div class="limit-row">
+            <span class="limit-label">Requests / นาที</span>
+            <span class="limit-val">15 RPM</span>
+        </div>
+        <div class="limit-row">
+            <span class="limit-label">Requests / วัน</span>
+            <span class="limit-val">1,500 RPD</span>
+        </div>
+        <div class="limit-row">
+            <span class="limit-label">Tokens / นาที</span>
+            <span class="limit-val">250,000 TPM</span>
+        </div>
+        <div class="limit-row">
+            <span class="limit-label">Tokens / วัน</span>
+            <span class="limit-val">1,000,000 TPD</span>
+        </div>
+        <div class="limit-row">
+            <span class="limit-label">Context Window</span>
+            <span class="limit-val">1,000,000 tokens</span>
+        </div>
+    </div>
+
+    <div class="footer">หน้านี้รีเฟรชอัตโนมัติทุก 30 วินาที • สถิติรีเซตเมื่อ restart บอท</div>
+
+</div>
+</body>
+</html>"""
     return html
 
 def run_web():
@@ -189,24 +405,15 @@ async def on_message(message):
             response = chat.send_message(user_input)
             reply = response.text
             output_tokens = count_tokens(reply)
-            total_used = input_tokens + output_tokens
 
             stats["total_requests"] += 1
             stats["total_tokens_in"] += input_tokens
             stats["total_tokens_out"] += output_tokens
 
-            limit_info = (
-                f"\n\n> 📊 Token: `{input_tokens}` in / `{output_tokens}` out | รวม `{total_used}`\n"
-                f"> 🆓 ใช้ไปแล้ว `{stats['total_requests']}` req • `{stats['total_tokens_in'] + stats['total_tokens_out']:,}` tokens วันนี้"
-            )
-
-            full_reply = reply + limit_info
-
-            if len(full_reply) > 2000:
-                await message.reply(reply[:1900] + "...")
-                await message.channel.send(limit_info)
+            if len(reply) > 2000:
+                await message.reply(reply[:1950] + "...")
             else:
-                await message.reply(full_reply)
+                await message.reply(reply)
 
         except Exception as e:
             await message.reply(f"❌ เกิดข้อผิดพลาด: `{str(e)}`")
