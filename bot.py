@@ -1,10 +1,9 @@
 import discord
 import google.generativeai as genai
 import os
-import io
-import json
 import datetime
-import aiohttp
+import random
+import time
 from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
@@ -52,29 +51,15 @@ SYSTEM_PROMPT = """
 - ไม่ช่วยสร้างมัลแวร์หรือหลอกลวง
 - ไม่สร้างเนื้อหาทางเพศอย่างโจ่งแจ้ง
 """
-
-REACTION_PROMPT = """อ่านข้อความนี้แล้วตอบแค่ emoji เดียวที่เหมาะสมที่สุด
-ห้ามมีข้อความอื่นนอกจาก emoji ตัวเดียว
-
-ตัวอย่าง:
-- ข้อความตลก → 😂
-- ข้อความเศร้า → 🥺
-- ข้อความโกรธ → 💀
-- ข้อความน่ารัก → 🥰
-- ถามคำถาม → 🤔
-- บอกข่าวดี → 🎉
-- พูดเรื่องอาหาร → 😋
-- เรื่องเกม → 🎮
-- คำหยาบ/แซว → 💀
-
-ข้อความ:"""
 # ============================
 
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
-reaction_model = genai.GenerativeModel(MODEL_NAME)
 
 chat_sessions = {}
+react_cooldown = {}
+REACT_COOLDOWN_SEC = 10
+
 stats = {
     "total_requests": 0,
     "total_tokens_in": 0,
@@ -83,6 +68,25 @@ stats = {
     "total_images": 0,
     "start_time": datetime.datetime.now(),
 }
+
+# keyword → emoji pool
+EMOJI_MAP = [
+    (["ฮ่า", "555", "ขำ", "ตลก", "lol", "lmao", "haha", "ฮาา"], ["😂", "💀", "🤣"]),
+    (["เศร้า", "หม่น", "ร้องไห้", "sad", "ซึ้ง", "เสียใจ"], ["🥺", "😢", "💔"]),
+    (["โกรธ", "หัวร้อน", "หัวร้อน", "wtf", "เหี้ย", "บ้า", "ห่า"], ["💢", "😤", "🤬"]),
+    (["น่ารัก", "cute", "อ่อน", "หวาน", "ปิ๊ง"], ["🥰", "😍", "💕"]),
+    (["เกม", "game", "ranked", "ดรอป", "ff", "gg", "ez"], ["🎮", "👾", "🕹️"]),
+    (["อาหาร", "กิน", "หิว", "อร่อย", "ข้าว", "ชา", "กาแฟ", "ชานม"], ["😋", "🍜", "🤤"]),
+    (["นอน", "ง่วง", "zzz", "หลับ", "ตื่น"], ["😴", "💤"]),
+    (["เหนื่อย", "ท้อ", "ไม่ไหว", "พัง", "หมดแรง"], ["😮‍💨", "💀", "🫠"]),
+    (["เย้", "ยินดี", "ดีใจ", "congrats", "ปาร์ตี้", "ฉลอง", "ผ่าน"], ["🎉", "🥳", "🎊"]),
+    (["?", "ทำไม", "อะไร", "ยังไง", "เหรอ", "จริงหรอ", "แน่ใจ"], ["🤔", "👀", "❓"]),
+    (["ดี", "เก่ง", "เยี่ยม", "โคตร", "ปัง", "สุด", "เทพ"], ["🔥", "👏", "✨"]),
+    (["อนิเมะ", "มังงะ", "วาย", "ซีรี่ส์", "ดูอะไร"], ["👀", "🍿", "✨"]),
+    (["รัก", "ชอบ", "แฟน", "กอด", "คิดถึง"], ["💖", "🥰", "💌"]),
+    (["เงิน", "ตัง", "แพง", "จน", "broke"], ["💸", "😭", "🪙"]),
+    (["ดนตรี", "เพลง", "ฟัง", "spotify", "cover"], ["🎵", "🎶", "🎧"]),
+]
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -104,19 +108,25 @@ def count_tokens(text):
 
 
 async def auto_react(message):
-    """AI เลือก emoji react อัตโนมัติ"""
+    """React emoji ตาม keyword ไม่ใช้ AI — ประหยัด quota"""
     try:
         if len(message.content.strip()) < 2:
             return
 
-        response = reaction_model.generate_content(
-            REACTION_PROMPT + f"\n{message.content}"
-        )
-        emoji = response.text.strip()
+        now = time.time()
+        if now - react_cooldown.get(message.author.id, 0) < REACT_COOLDOWN_SEC:
+            return
 
-        # เช็คว่าเป็น emoji จริงๆ (กันบอทส่งข้อความแปลกๆ มา)
-        if emoji and len(emoji) <= 10 and not any(c.isalpha() for c in emoji):
-            await message.add_reaction(emoji)
+        text = message.content.lower()
+        matched = []
+
+        for keywords, emojis in EMOJI_MAP:
+            if any(kw in text for kw in keywords):
+                matched.append(random.choice(emojis))
+
+        if matched:
+            await message.add_reaction(matched[0])
+            react_cooldown[message.author.id] = now
             stats["total_reactions"] += 1
 
     except Exception as e:
@@ -125,8 +135,7 @@ async def auto_react(message):
 
 async def generate_image(prompt):
     encoded = prompt.replace(" ", "%20")
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true"
-    return url
+    return f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true"
 
 
 async def process_message(message, user_input, image_data=None):
@@ -135,31 +144,21 @@ async def process_message(message, user_input, image_data=None):
             chat = get_chat(message.author.id)
 
             if image_data:
-                prompt_parts = []
-                if user_input:
-                    prompt_parts.append(user_input)
-                else:
-                    prompt_parts.append("อธิบายรูปนี้ให้หน่อย")
-                prompt_parts.append(image_data)
-                response = model.generate_content(prompt_parts)
+                parts = [user_input or "อธิบายรูปนี้ให้หน่อย", image_data]
+                response = model.generate_content(parts)
             else:
                 response = chat.send_message(user_input)
 
             reply = response.text
 
             try:
-                in_tok = count_tokens(user_input or "")
-                out_tok = count_tokens(reply)
                 stats["total_requests"] += 1
-                stats["total_tokens_in"] += in_tok
-                stats["total_tokens_out"] += out_tok
+                stats["total_tokens_in"] += count_tokens(user_input or "")
+                stats["total_tokens_out"] += count_tokens(reply)
             except:
                 pass
 
-            if len(reply) > 2000:
-                await message.reply(reply[:1950] + "...")
-            else:
-                await message.reply(reply)
+            await message.reply(reply[:1950] + "..." if len(reply) > 2000 else reply)
 
         except Exception as e:
             await message.reply(f"❌ `{str(e)}`")
@@ -266,7 +265,7 @@ def home():
             <div class="card-icon">😄</div>
             <div class="card-label">Auto Reactions</div>
             <div class="card-value">{stats["total_reactions"]}</div>
-            <div class="card-sub">AI เลือก emoji เอง</div>
+            <div class="card-sub">keyword-based ไม่กิน quota</div>
         </div>
         <div class="card">
             <div class="card-icon">🎨</div>
@@ -324,7 +323,6 @@ async def on_message(message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     in_allowed = message.channel.id in ALLOWED_CHANNELS
 
-    # Auto React เฉพาะห้องที่กำหนด (ไม่รวม DM)
     if not is_dm and in_allowed and message.content.strip():
         await auto_react(message)
 
