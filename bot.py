@@ -22,8 +22,6 @@ API_KEYS = [k for k in [
     os.getenv("GEMINI_API_KEY_3"),
 ] if k]
 
-key_cycle = itertools.cycle(API_KEYS)
-
 ALLOWED_CHANNELS = [
     1518970044925739160,
     1519823094816968867,
@@ -85,11 +83,12 @@ def now_th():
     """เวลาปัจจุบัน UTC+7"""
     return datetime.datetime.now(TZ_OFFSET)
 
-def make_model():
-    key = next(key_cycle)
+def make_model_with_key(key: str):
+    """สร้าง model โดยใช้ key ที่ระบุชัดๆ"""
     genai.configure(api_key=key)
     return genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
 
+# chat_sessions เก็บ (key_index, chat_object) เพื่อรู้ว่า session นี้ใช้ key ไหนอยู่
 chat_sessions = {}
 react_cooldown = {}
 REACT_COOLDOWN_SEC = 10
@@ -110,10 +109,16 @@ intents.members = True
 client = discord.Client(intents=intents)
 
 
-def get_chat(user_id):
-    if user_id not in chat_sessions:
-        chat_sessions[user_id] = make_model().start_chat(history=[])
-    return chat_sessions[user_id]
+def get_or_create_chat(user_id: int, key_index: int):
+    """คืน chat session ที่ใช้ key_index นั้น ถ้าไม่มีหรือ key เปลี่ยนให้สร้างใหม่"""
+    existing = chat_sessions.get(user_id)
+    if existing and existing[0] == key_index:
+        return existing[1]
+    # สร้าง session ใหม่ด้วย key ที่ถูกต้อง
+    model = make_model_with_key(API_KEYS[key_index])
+    chat = model.start_chat(history=[])
+    chat_sessions[user_id] = (key_index, chat)
+    return chat
 
 
 def count_tokens(text):
@@ -170,14 +175,19 @@ async def process_message(message, user_input, image_data=None):
     async with message.channel.typing():
         last_error = None
 
-        for attempt in range(len(API_KEYS) or 1):
+        for key_index in range(len(API_KEYS)):
             try:
-                chat = get_chat(message.author.id)
+                key = API_KEYS[key_index]
+                print(f"[INFO] ลองใช้ key {key_index + 1}/{len(API_KEYS)} ({key[:8]}...)")
 
                 if image_data:
+                    # image ไม่ต้องการ chat session
+                    model = make_model_with_key(key)
                     parts = [user_input or "อธิบายรูปนี้ให้หน่อย", image_data]
-                    response = make_model().generate_content(parts)
+                    response = model.generate_content(parts)
                 else:
+                    # ดึง/สร้าง chat session ที่ผูกกับ key นี้ชัดๆ
+                    chat = get_or_create_chat(message.author.id, key_index)
                     response = chat.send_message(user_input)
 
                 reply = response.text
@@ -189,20 +199,18 @@ async def process_message(message, user_input, image_data=None):
                 return  # สำเร็จ → ออกเลย
 
             except Exception as e:
-                err_msg = str(e)
                 last_error = e
+                err_msg = str(e)
 
-                # 429 และยังมี key เหลือ → switch key แล้วลองใหม่
-                if "429" in err_msg and attempt < len(API_KEYS) - 1:
-                    print(f"[WARN] key {attempt+1} quota hit, switching key...")
-                    chat_sessions.pop(message.author.id, None)
-                    await asyncio.sleep(2)
-                    continue
+                if "429" in err_msg and key_index < len(API_KEYS) - 1:
+                    print(f"[WARN] key {key_index + 1} quota hit → switching to key {key_index + 2}")
+                    await asyncio.sleep(1)
+                    continue  # ลอง key ถัดไป
 
-                # error อื่น หรือ key หมดทุกอัน → หยุดเลย
+                # error อื่น หรือ key หมดทุกอัน
                 break
 
-        # reply error แค่ครั้งเดียวหลัง loop จบ
+        # reply error แค่ครั้งเดียว
         if last_error:
             await message.reply(parse_error(last_error))
 
@@ -211,7 +219,7 @@ async def process_message(message, user_input, image_data=None):
 # AUTO RESET DAILY STATS
 # =======================
 async def reset_daily_stats():
-    """รีเซต stats ทุกวันตอน 07:00 น. UTC+7 (= 00:00 UTC)"""
+    """รีเซต stats ทุกวันตอน 07:00 น. UTC+7"""
     await client.wait_until_ready()
     while not client.is_closed():
         now = now_th()
@@ -229,6 +237,7 @@ async def reset_daily_stats():
         stats["total_reactions"] = 0
         stats["total_images"] = 0
         stats["last_reset"] = now_th()
+        chat_sessions.clear()  # clear sessions ด้วยเพื่อให้ key_index reset
         print(f"[RESET] ✅ รีเซต daily stats แล้ว! ({stats['last_reset'].strftime('%d/%m/%Y %H:%M')} น.)")
 
 
