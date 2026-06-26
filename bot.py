@@ -59,23 +59,12 @@ SYSTEM_PROMPT = """
 - ไม่สร้างเนื้อหาทางเพศอย่างโจ่งแจ้ง
 """
 
-EMOJI_MAP = [
-    (["ฮ่า", "555", "ขำ", "ตลก", "lol", "lmao", "haha", "ฮาา"], ["😂", "💀", "🤣"]),
-    (["เศร้า", "หม่น", "ร้องไห้", "sad", "ซึ้ง", "เสียใจ"], ["🥺", "😢", "💔"]),
-    (["โกรธ", "หัวร้อน", "wtf", "เหี้ย", "บ้า", "ห่า"], ["💢", "😤", "🤬"]),
-    (["น่ารัก", "cute", "อ่อน", "หวาน", "ปิ๊ง"], ["🥰", "😍", "💕"]),
-    (["เกม", "game", "ranked", "ดรอป", "ff", "gg", "ez"], ["🎮", "👾", "🕹️"]),
-    (["อาหาร", "กิน", "หิว", "อร่อย", "ข้าว", "ชา", "กาแฟ", "ชานม"], ["😋", "🍜", "🤤"]),
-    (["นอน", "ง่วง", "zzz", "หลับ", "ตื่น"], ["😴", "💤"]),
-    (["เหนื่อย", "ท้อ", "ไม่ไหว", "พัง", "หมดแรง"], ["😮‍💨", "💀", "🫠"]),
-    (["เย้", "ยินดี", "ดีใจ", "congrats", "ฉลอง", "ผ่าน"], ["🎉", "🥳", "🎊"]),
-    (["ทำไม", "อะไร", "ยังไง", "เหรอ", "จริงหรอ", "แน่ใจ"], ["🤔", "👀", "❓"]),
-    (["ดี", "เก่ง", "เยี่ยม", "โคตร", "ปัง", "สุด", "เทพ"], ["🔥", "👏", "✨"]),
-    (["อนิเมะ", "มังงะ", "ซีรี่ส์", "ดูอะไร"], ["👀", "🍿", "✨"]),
-    (["รัก", "ชอบ", "แฟน", "กอด", "คิดถึง"], ["💖", "🥰", "💌"]),
-    (["เงิน", "ตัง", "แพง", "จน", "broke"], ["💸", "😭", "🪙"]),
-    (["เพลง", "ฟัง", "spotify", "cover"], ["🎵", "🎶", "🎧"]),
-]
+REACT_SYSTEM_PROMPT = """
+คุณคือระบบเลือก emoji reaction สำหรับข้อความใน Discord
+อ่านข้อความแล้วตอบด้วย emoji ที่เหมาะสมที่สุด 1 ตัวเท่านั้น
+ห้ามตอบอะไรนอกจาก emoji ตัวเดียว ไม่มีข้อความ ไม่มีช่องว่าง
+ถ้าข้อความไม่เหมาะกับ emoji ใดเลย ให้ตอบว่า NONE
+"""
 # ============================
 
 def now_th():
@@ -84,6 +73,10 @@ def now_th():
 def make_model_with_key(key: str):
     genai.configure(api_key=key)
     return genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
+
+def make_react_model_with_key(key: str):
+    genai.configure(api_key=key)
+    return genai.GenerativeModel(MODEL_NAME, system_instruction=REACT_SYSTEM_PROMPT)
 
 chat_sessions = {}
 exhausted_keys = set()
@@ -124,10 +117,24 @@ def count_tokens(text):
         return 0
 
 
+def is_daily_quota_error(msg: str) -> bool:
+    msg_lower = msg.lower()
+    return any(x in msg_lower for x in [
+        "per_day", "perday", "daily", "quota exceeded",
+        "generaterequestsperdayperproject",
+        "resource_exhausted",
+    ]) or (
+        "429" in msg
+        and "per_minute" not in msg_lower
+        and "perminute" not in msg_lower
+        and "per_minute" not in msg_lower
+    )
+
+
 def parse_error(e: Exception) -> str:
     msg = str(e)
     if "429" in msg:
-        if "per_day" in msg.lower() or "PerDay" in msg or "GenerateRequestsPerDay" in msg:
+        if is_daily_quota_error(msg):
             return "❌ quota วันนี้หมดแล้วอ่ะ รอรีเซตตอน 07:00 น. (UTC+7) นะ 🙏"
         if "per_minute" in msg.lower() or "PerMinute" in msg or "GenerateRequestsPerMinute" in msg:
             return "⏳ request เยอะเกินต่อนาทีอ่ะ รอแป๊บนึงแล้วลองใหม่นะ"
@@ -145,19 +152,38 @@ def parse_error(e: Exception) -> str:
     return f"❌ เกิด error อ่ะ: `{msg[:200]}`"
 
 
+def get_active_key_index():
+    """หา key index แรกที่ยังไม่ exhausted"""
+    for i in range(len(API_KEYS)):
+        if i not in exhausted_keys:
+            return i
+    return None
+
+
 async def auto_react(message):
+    """ให้ AI เลือก emoji เองจากเนื้อหาข้อความ"""
     try:
         if len(message.content.strip()) < 2:
             return
         now = time.time()
         if now - react_cooldown.get(message.author.id, 0) < REACT_COOLDOWN_SEC:
             return
-        text = message.content.lower()
-        matched = [random.choice(emojis) for kws, emojis in EMOJI_MAP if any(kw in text for kw in kws)]
-        if matched:
-            await message.add_reaction(matched[0])
+
+        key_index = get_active_key_index()
+        if key_index is None:
+            return
+
+        key = API_KEYS[key_index]
+        react_model = make_react_model_with_key(key)
+        response = react_model.generate_content(message.content[:300])
+        emoji = response.text.strip()
+
+        if emoji and emoji != "NONE" and len(emoji) <= 8:
+            await message.add_reaction(emoji)
             react_cooldown[message.author.id] = now
             stats["total_reactions"] += 1
+            print(f"[REACT] '{message.content[:30]}' → {emoji}")
+
     except Exception as e:
         print(f"[REACT ERROR] {e}")
 
@@ -167,7 +193,6 @@ async def generate_image(prompt):
     return f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true"
 
 
-# ===== ส่วนที่แก้: typing loop แยก =====
 async def _keep_typing(channel):
     """ส่ง typing indicator ทุก 8 วิ จนกว่าจะถูก cancel"""
     try:
@@ -204,6 +229,10 @@ async def process_message(message, user_input, image_data=None):
                     parts = [user_input or "อธิบายรูปนี้ให้หน่อย", image_data]
                     response = model.generate_content(parts)
                 else:
+                    # ถ้า key เปลี่ยน ล้าง session เก่าทิ้ง
+                    existing = chat_sessions.get(message.author.id)
+                    if existing and existing[0] != key_index:
+                        del chat_sessions[message.author.id]
                     chat = get_or_create_chat(message.author.id, key_index)
                     response = chat.send_message(user_input)
 
@@ -218,9 +247,10 @@ async def process_message(message, user_input, image_data=None):
             except Exception as e:
                 last_error = e
                 err_msg = str(e)
+                print(f"[ERROR] key {key_index + 1}: {err_msg[:300]}")
 
                 if "429" in err_msg:
-                    if "per_day" in err_msg.lower() or "PerDay" in err_msg or "GenerateRequestsPerDay" in err_msg:
+                    if is_daily_quota_error(err_msg):
                         exhausted_keys.add(key_index)
                         remaining = len(API_KEYS) - len(exhausted_keys)
                         print(f"[WARN] key {key_index + 1} daily quota หมด → blacklist (เหลือ {remaining} key(s))")
@@ -237,7 +267,6 @@ async def process_message(message, user_input, image_data=None):
     finally:
         typing_task.cancel()
         processing_users.discard(message.author.id)
-# ========================================
 
 
 # =======================
@@ -361,7 +390,7 @@ def home():
     </div>
     <div class="model-card">
         <div class="model-icon">✨</div>
-        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + Auto React + Image Gen</div></div>
+        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + AI React + Image Gen</div></div>
         <div class="model-badge">Free Tier · {len(API_KEYS)} key(s) · {len(API_KEYS) - len(exhausted_keys)} active</div>
     </div>
     <div class="grid">
@@ -387,9 +416,9 @@ def home():
         </div>
         <div class="card">
             <div class="card-icon">😄</div>
-            <div class="card-label">Auto Reactions</div>
+            <div class="card-label">AI Reactions</div>
             <div class="card-value">{stats["total_reactions"]}</div>
-            <div class="card-sub">keyword-based ไม่กิน quota</div>
+            <div class="card-sub">AI เลือก emoji เองตามบริบท</div>
         </div>
         <div class="card">
             <div class="card-icon">🎨</div>
@@ -453,7 +482,7 @@ async def on_message(message):
     in_allowed = message.channel.id in ALLOWED_CHANNELS
 
     if not is_dm and in_allowed and message.content.strip():
-        await auto_react(message)
+        asyncio.create_task(auto_react(message))
 
     if not is_dm and not in_allowed:
         return
