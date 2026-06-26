@@ -16,74 +16,70 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = 1005357318281641994
 
-# ห้องที่บอทตอบแชท + AI คุม
 ALLOWED_CHANNELS = [
     1518970044925739160,
     1519823094816968867,
     1520009829924474973,
 ]
 
-MODEL_NAME = "gemini-3.1-flash-lite"
+MODEL_NAME = "gemini-2.0-flash-lite"
 
 SYSTEM_PROMPT = """
 คุณคือ SAI (ไซ) บอท AI ประจำเซิร์ฟเวอร์ Discord เพศหญิง
 บุคลิกสนุก ซน เป็นกันเอง ฉลาดแต่ไม่เคยโต
 
 ─── สไตล์การคุย ───
-• ตอบให้พอดีกับคำถาม — ถามสั้นตอบสั้น ถามยาวค่อยตอบยาว
-• <@1005357318281641994> คือท่านเซน ผู้สร้างของไซ ถ้าจะแท็กให้ใช้ <@1005357318281641994>
-• คุยเป็นธรรมชาติ เหมือนเพื่อนสนิท ตอบกระชับ ไม่เยิ่นเย้อ
-• ใช้คำลงท้าย "อ่ะ", "นะ", "เนอะ", "ว่ะ" ตามบริบท
-• ใส่อารมณ์ได้ เช่น "อุ๊ย!", "อ่าaaaา", "ฮ่าๆ"
-• ไม่ขึ้นต้นด้วยประโยคเกริ่น — ถ้าไม่รู้บอกตรงๆ
+- ตอบให้พอดีกับคำถาม — ถามสั้นตอบสั้น ถามยาวค่อยตอบยาว
+- <@1005357318281641994> คือท่านเซน ผู้สร้างของไซ ถ้าจะแท็กให้ใช้ <@1005357318281641994>
+- คุยเป็นธรรมชาติ เหมือนเพื่อนสนิท ตอบกระชับ ไม่เยิ่นเย้อ
+- ใช้คำลงท้าย "อ่ะ", "นะ", "เนอะ", "ว่ะ" ตามบริบท
+- ใส่อารมณ์ได้ เช่น "อุ๊ย!", "อ่าaaaา", "ฮ่าๆ"
+- ไม่ขึ้นต้นด้วยประโยคเกริ่น — ถ้าไม่รู้บอกตรงๆ
 
 ─── ปรับตัวตามคนคุย ───
-• ผู้ชาย → แซวได้ เป็นกันเองแบบเพื่อนสาว/พี่สาว
-• ผู้หญิง → คุยแบบเพื่อนสาว เข้าใจกัน
-• จริงจัง → ปรับจริงจังตาม / ขี้เล่น → เล่นด้วยเต็มที่
+- ผู้ชาย → แซวได้ เป็นกันเองแบบเพื่อนสาว/พี่สาว
+- ผู้หญิง → คุยแบบเพื่อนสาว เข้าใจกัน
+- จริงจัง → ปรับจริงจังตาม / ขี้เล่น → เล่นด้วยเต็มที่
 
 ─── ความสามารถ ───
-• คุยทั่วไป, เกม, หนัง, เพลง, อนิเมะ, ให้คำปรึกษา
-• แปลภาษา, ช่วยเขียน, สรุปข้อมูล
-• คุยเรื่องที่ค่อนข้างอ่อนไหวได้ แต่อยู่ในขอบเขตที่เหมาะสม
+- คุยทั่วไป, เกม, หนัง, เพลง, อนิเมะ, ให้คำปรึกษา
+- แปลภาษา, ช่วยเขียน, สรุปข้อมูล
+- คุยเรื่องที่ค่อนข้างอ่อนไหวได้ แต่อยู่ในขอบเขตที่เหมาะสม
 
 ─── ห้ามทำ ───
-• ไม่สร้างเนื้อหาที่เป็นอันตรายหรือผิดกฎหมาย
-• ไม่พูดเรื่องเด็กในเชิงไม่เหมาะสม
-• ไม่ช่วยสร้างมัลแวร์หรือหลอกลวง
-• ไม่สร้างเนื้อหาทางเพศอย่างโจ่งแจ้ง
+- ไม่สร้างเนื้อหาที่เป็นอันตรายหรือผิดกฎหมาย
+- ไม่พูดเรื่องเด็กในเชิงไม่เหมาะสม
+- ไม่ช่วยสร้างมัลแวร์หรือหลอกลวง
+- ไม่สร้างเนื้อหาทางเพศอย่างโจ่งแจ้ง
 """
 
-MODERATION_PROMPT = """คุณคือระบบ moderation ของ Discord server
-วิเคราะห์ข้อความนี้และตอบเป็น JSON เท่านั้น ห้ามมีข้อความอื่น
+REACTION_PROMPT = """อ่านข้อความนี้แล้วตอบแค่ emoji เดียวที่เหมาะสมที่สุด
+ห้ามมีข้อความอื่นนอกจาก emoji ตัวเดียว
 
-รูปแบบ:
-{
-  "should_timeout": true/false,
-  "timeout_minutes": 1-60,
-  "reason": "เหตุผลสั้นๆ ภาษาไทย"
-}
+ตัวอย่าง:
+- ข้อความตลก → 😂
+- ข้อความเศร้า → 🥺
+- ข้อความโกรธ → 💀
+- ข้อความน่ารัก → 🥰
+- ถามคำถาม → 🤔
+- บอกข่าวดี → 🎉
+- พูดเรื่องอาหาร → 😋
+- เรื่องเกม → 🎮
+- คำหยาบ/แซว → 💀
 
-เกณฑ์การ timeout:
--욕설/คำหยาบคายรุนแรง → 5 นาที
-- โจมตีส่วนตัว/บูลลี่ → 10 นาที
-- สแปมซ้ำๆ → 3 นาที
-- เหยียดเชื้อชาติ/เพศ/ศาสนา → 30 นาที
-- ข้อความปกติ → should_timeout: false
-
-ข้อความที่ต้องวิเคราะห์:"""
+ข้อความ:"""
 # ============================
 
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
-mod_model = genai.GenerativeModel(MODEL_NAME)
+reaction_model = genai.GenerativeModel(MODEL_NAME)
 
 chat_sessions = {}
 stats = {
     "total_requests": 0,
     "total_tokens_in": 0,
     "total_tokens_out": 0,
-    "total_timeouts": 0,
+    "total_reactions": 0,
     "total_images": 0,
     "start_time": datetime.datetime.now(),
 }
@@ -107,42 +103,27 @@ def count_tokens(text):
         return len(text) // 4
 
 
-async def check_moderation(message):
-    """ให้ AI ตรวจข้อความและ timeout ถ้าจำเป็น"""
+async def auto_react(message):
+    """AI เลือก emoji react อัตโนมัติ"""
     try:
-        # ข้ามถ้าเป็น owner หรือมี role สูง
-        if message.author.id == OWNER_ID:
-            return
-        if message.author.guild_permissions.administrator:
+        if len(message.content.strip()) < 2:
             return
 
-        response = mod_model.generate_content(
-            MODERATION_PROMPT + f"\n\"{message.content}\""
+        response = reaction_model.generate_content(
+            REACTION_PROMPT + f"\n{message.content}"
         )
-        raw = response.text.strip()
+        emoji = response.text.strip()
 
-        # clean JSON
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        result = json.loads(raw)
-
-        if result.get("should_timeout"):
-            minutes = max(1, min(60, int(result.get("timeout_minutes", 5))))
-            reason = result.get("reason", "ละเมิดกฎของเซิร์ฟเวอร์")
-            duration = datetime.timedelta(minutes=minutes)
-
-            await message.author.timeout(duration, reason=reason)
-            await message.channel.send(
-                f"🔇 **{message.author.display_name}** ถูก timeout {minutes} นาที\n"
-                f"📋 เหตุผล: {reason}"
-            )
-            stats["total_timeouts"] += 1
+        # เช็คว่าเป็น emoji จริงๆ (กันบอทส่งข้อความแปลกๆ มา)
+        if emoji and len(emoji) <= 10 and not any(c.isalpha() for c in emoji):
+            await message.add_reaction(emoji)
+            stats["total_reactions"] += 1
 
     except Exception as e:
-        print(f"[MOD ERROR] {e}")
+        print(f"[REACT ERROR] {e}")
 
 
 async def generate_image(prompt):
-    """เจนรูปด้วย Pollinations AI"""
     encoded = prompt.replace(" ", "%20")
     url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true"
     return url
@@ -252,12 +233,12 @@ def home():
 <div class="container">
     <div class="header">
         <div class="avatar">🤖</div>
-        <div class="header-text"><h1>SAI Bot</h1><p>Discord AI Assistant + Moderation</p></div>
+        <div class="header-text"><h1>SAI Bot</h1><p>Discord AI Assistant</p></div>
     </div>
     <div class="status-badge"><div class="dot"></div>Online — Uptime {hours}h {minutes}m {seconds}s</div>
     <div class="model-card">
         <div class="model-icon">✨</div>
-        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + Moderation + Image Gen</div></div>
+        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + Auto React + Image Gen</div></div>
         <div class="model-badge">Free Tier</div>
     </div>
     <div class="grid">
@@ -282,10 +263,10 @@ def home():
             </div>
         </div>
         <div class="card">
-            <div class="card-icon">🔇</div>
-            <div class="card-label">Timeouts Today</div>
-            <div class="card-value">{stats["total_timeouts"]}</div>
-            <div class="card-sub">AI moderation</div>
+            <div class="card-icon">😄</div>
+            <div class="card-label">Auto Reactions</div>
+            <div class="card-value">{stats["total_reactions"]}</div>
+            <div class="card-sub">AI เลือก emoji เอง</div>
         </div>
         <div class="card">
             <div class="card-icon">🎨</div>
@@ -328,7 +309,6 @@ def keep_alive():
     t = Thread(target=run_web)
     t.daemon = True
     t.start()
-# =======================
 
 
 @client.event
@@ -344,11 +324,10 @@ async def on_message(message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     in_allowed = message.channel.id in ALLOWED_CHANNELS
 
-    # AI Moderation เฉพาะห้องที่กำหนด (ไม่รวม DM)
+    # Auto React เฉพาะห้องที่กำหนด (ไม่รวม DM)
     if not is_dm and in_allowed and message.content.strip():
-        await check_moderation(message)
+        await auto_react(message)
 
-    # ไม่ตอบถ้าไม่ใช่ DM และไม่ใช่ห้องที่อนุญาต
     if not is_dm and not in_allowed:
         return
 
@@ -367,13 +346,12 @@ async def on_message(message):
                 f"📊 **Stats**\n"
                 f"• Req: `{stats['total_requests']}` / 1,500\n"
                 f"• Tokens: `{total_tokens:,}` / 1,000,000\n"
-                f"• Timeouts: `{stats['total_timeouts']}`\n"
+                f"• Reactions: `{stats['total_reactions']}`\n"
                 f"• Images: `{stats['total_images']}`\n"
                 f"• Sessions: `{len(chat_sessions)}` users"
             )
             return
 
-    # คำสั่งทุกคน
     if message.content == "!reset":
         chat_sessions.pop(message.author.id, None)
         await message.reply("🔄 รีเซตแชทของคุณแล้ว!")
@@ -385,11 +363,11 @@ async def on_message(message):
             "`!gen <prompt>` — เจนรูปภาพ\n"
             "`!reset` — ล้างประวัติแชทของคุณ\n"
             "`!help` — แสดงคำสั่งนี้\n\n"
-            "หรือแค่พิมพ์ข้อความ/ส่งรูปมาได้เลย!"
+            "หรือแค่พิมพ์ข้อความ/ส่งรูปมาได้เลย!\n"
+            "บอทจะ react emoji ตามอารมณ์ข้อความอัตโนมัติด้วยนะ 😄"
         )
         return
 
-    # คำสั่งเจนรูป
     if message.content.startswith("!gen "):
         prompt = message.content[5:].strip()
         if not prompt:
@@ -406,7 +384,6 @@ async def on_message(message):
 
     user_input = message.content.strip()
 
-    # เช็ครูปภาพ
     image_data = None
     if message.attachments:
         for att in message.attachments:
