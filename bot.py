@@ -16,7 +16,6 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = 1005357318281641994
 
-# ใส่ key เพิ่มได้เรื่อยๆ กัน quota หมด
 API_KEYS = [k for k in [
     os.getenv("GEMINI_API_KEY"),
     os.getenv("GEMINI_API_KEY_2"),
@@ -32,6 +31,7 @@ ALLOWED_CHANNELS = [
 ]
 
 MODEL_NAME = "gemini-2.0-flash-lite"
+TZ_OFFSET = datetime.timezone(datetime.timedelta(hours=7))  # UTC+7
 
 SYSTEM_PROMPT = """
 คุณคือ SAI (ไซ) บอท AI ประจำเซิร์ฟเวอร์ Discord เพศหญิง
@@ -81,6 +81,10 @@ EMOJI_MAP = [
 ]
 # ============================
 
+def now_th():
+    """เวลาปัจจุบัน UTC+7"""
+    return datetime.datetime.now(TZ_OFFSET)
+
 def make_model():
     key = next(key_cycle)
     genai.configure(api_key=key)
@@ -96,7 +100,8 @@ stats = {
     "total_tokens_out": 0,
     "total_reactions": 0,
     "total_images": 0,
-    "start_time": datetime.datetime.now(),
+    "start_time": now_th(),
+    "last_reset": now_th(),
 }
 
 intents = discord.Intents.default()
@@ -119,7 +124,6 @@ def count_tokens(text):
 
 
 def parse_error(e: Exception) -> str:
-    """แปลง error เป็นข้อความภาษาคนอ่านได้"""
     msg = str(e)
     if "429" in msg:
         if "per_day" in msg.lower() or "PerDay" in msg or "GenerateRequestsPerDay" in msg:
@@ -141,7 +145,6 @@ def parse_error(e: Exception) -> str:
 
 
 async def auto_react(message):
-    """React emoji ตาม keyword — ไม่กิน quota"""
     try:
         if len(message.content.strip()) < 2:
             return
@@ -185,15 +188,40 @@ async def process_message(message, user_input, image_data=None):
 
             except Exception as e:
                 err_msg = str(e)
-                # ถ้า 429 per-minute → รอ 60 วิแล้วลอง key ถัดไป
                 if "429" in err_msg and attempt < len(API_KEYS) - 1:
                     print(f"[WARN] key {attempt+1} quota hit, switching key...")
-                    chat_sessions.pop(message.author.id, None)  # reset session ให้ใช้ key ใหม่
+                    chat_sessions.pop(message.author.id, None)
                     await asyncio.sleep(2)
                     continue
-                # error อื่น หรือ key หมดทุกอัน
                 await message.reply(parse_error(e))
                 return
+
+
+# =======================
+# AUTO RESET DAILY STATS
+# =======================
+async def reset_daily_stats():
+    """รีเซต stats ทุกวันตอน 07:00 น. UTC+7 (= 00:00 UTC)"""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        now = now_th()
+        # คำนวณเวลา 07:00 น. วันถัดไป (UTC+7)
+        next_reset = now.replace(hour=7, minute=0, second=0, microsecond=0)
+        if now >= next_reset:
+            next_reset += datetime.timedelta(days=1)
+
+        wait_seconds = (next_reset - now).total_seconds()
+        print(f"[RESET] จะรีเซต stats ในอีก {wait_seconds/3600:.1f} ชั่วโมง (ตอน {next_reset.strftime('%d/%m/%Y %H:%M')} น. UTC+7)")
+        await asyncio.sleep(wait_seconds)
+
+        # รีเซต
+        stats["total_requests"] = 0
+        stats["total_tokens_in"] = 0
+        stats["total_tokens_out"] = 0
+        stats["total_reactions"] = 0
+        stats["total_images"] = 0
+        stats["last_reset"] = now_th()
+        print(f"[RESET] ✅ รีเซต daily stats แล้ว! ({stats['last_reset'].strftime('%d/%m/%Y %H:%M')} น.)")
 
 
 # =======================
@@ -203,9 +231,22 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    uptime = datetime.datetime.now() - stats["start_time"]
+    uptime = now_th() - stats["start_time"]
     hours, remainder = divmod(int(uptime.total_seconds()), 3600)
     minutes, seconds = divmod(remainder, 60)
+
+    current_th = now_th().strftime("%d/%m/%Y %H:%M:%S")
+    last_reset_th = stats["last_reset"].strftime("%d/%m/%Y %H:%M")
+
+    # คำนวณเวลารีเซตครั้งถัดไป
+    _now = now_th()
+    next_reset = _now.replace(hour=7, minute=0, second=0, microsecond=0)
+    if _now >= next_reset:
+        next_reset += datetime.timedelta(days=1)
+    time_to_reset = next_reset - _now
+    reset_h, reset_rem = divmod(int(time_to_reset.total_seconds()), 3600)
+    reset_m = reset_rem // 60
+    next_reset_str = next_reset.strftime("%d/%m/%Y %H:%M")
 
     total_tokens = stats["total_tokens_in"] + stats["total_tokens_out"]
     daily_token_limit = 1_000_000
@@ -231,9 +272,12 @@ def home():
         .avatar {{ width: 56px; height: 56px; background: linear-gradient(135deg, #6366f1, #8b5cf6); border-radius: 16px; display: flex; align-items: center; justify-content: center; font-size: 28px; }}
         .header-text h1 {{ font-size: 1.5rem; font-weight: 700; background: linear-gradient(135deg, #a78bfa, #60a5fa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
         .header-text p {{ color: #64748b; font-size: 0.85rem; margin-top: 2px; }}
-        .status-badge {{ display: inline-flex; align-items: center; gap: 6px; background: #0f2d1f; border: 1px solid #166534; color: #4ade80; padding: 4px 12px; border-radius: 999px; font-size: 0.78rem; font-weight: 600; margin-bottom: 24px; }}
+        .status-badge {{ display: inline-flex; align-items: center; gap: 6px; background: #0f2d1f; border: 1px solid #166534; color: #4ade80; padding: 4px 12px; border-radius: 999px; font-size: 0.78rem; font-weight: 600; margin-bottom: 8px; }}
         .dot {{ width: 7px; height: 7px; background: #4ade80; border-radius: 50%; animation: pulse 2s infinite; }}
         @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} }}
+        .time-row {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }}
+        .time-chip {{ background: #13131f; border: 1px solid #1e1e30; border-radius: 999px; padding: 4px 14px; font-size: 0.75rem; color: #94a3b8; }}
+        .time-chip span {{ color: #c4b5fd; font-weight: 600; }}
         .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }}
         .card {{ background: #13131f; border: 1px solid #1e1e30; border-radius: 16px; padding: 20px; transition: border-color 0.2s; }}
         .card:hover {{ border-color: #6366f1; }}
@@ -256,6 +300,7 @@ def home():
         .limit-row:last-child {{ border-bottom: none; }}
         .limit-label {{ font-size: 0.85rem; color: #94a3b8; }}
         .limit-val {{ font-size: 0.85rem; font-weight: 600; color: #e2e8f0; }}
+        .reset-badge {{ color: #fbbf24; font-weight: 600; }}
         .footer {{ text-align: center; color: #334155; font-size: 0.72rem; margin-top: 24px; }}
         @media (max-width: 480px) {{ .grid {{ grid-template-columns: 1fr; }} }}
     </style>
@@ -267,6 +312,11 @@ def home():
         <div class="header-text"><h1>SAI Bot</h1><p>Discord AI Assistant</p></div>
     </div>
     <div class="status-badge"><div class="dot"></div>Online — Uptime {hours}h {minutes}m {seconds}s</div>
+    <div class="time-row">
+        <div class="time-chip">🕐 เวลาไทย (UTC+7): <span>{current_th} น.</span></div>
+        <div class="time-chip">🔄 รีเซตล่าสุด: <span>{last_reset_th} น.</span></div>
+        <div class="time-chip">⏳ รีเซตถัดไป: <span>{next_reset_str} น.</span> (อีก {reset_h}h {reset_m}m)</div>
+    </div>
     <div class="model-card">
         <div class="model-icon">✨</div>
         <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + Auto React + Image Gen</div></div>
@@ -326,8 +376,9 @@ def home():
         <div class="limit-row"><span class="limit-label">Tokens / วัน</span><span class="limit-val">1,000,000 TPD</span></div>
         <div class="limit-row"><span class="limit-label">API Keys ที่ใช้</span><span class="limit-val">{len(API_KEYS)} key(s)</span></div>
         <div class="limit-row"><span class="limit-label">Active Sessions</span><span class="limit-val">{len(chat_sessions)} users</span></div>
+        <div class="limit-row"><span class="limit-label">รีเซต stats อัตโนมัติ</span><span class="limit-val reset-badge">ทุกวัน 07:00 น. (UTC+7)</span></div>
     </div>
-    <div class="footer">หน้านี้รีเฟรชอัตโนมัติทุก 30 วินาที • สถิติรีเซตเมื่อ restart บอท</div>
+    <div class="footer">หน้านี้รีเฟรชอัตโนมัติทุก 30 วินาที • เวลาทั้งหมดเป็น UTC+7</div>
 </div>
 </body>
 </html>"""
@@ -346,6 +397,8 @@ def keep_alive():
 @client.event
 async def on_ready():
     print(f"✅ บอทออนไลน์แล้ว: {client.user} ({len(API_KEYS)} API key(s) โหลดแล้ว)")
+    print(f"🕐 เวลาไทยตอนนี้: {now_th().strftime('%d/%m/%Y %H:%M:%S')} น.")
+    client.loop.create_task(reset_daily_stats())
 
 
 @client.event
@@ -373,6 +426,13 @@ async def on_message(message):
             return
         if message.content == "!stats":
             total_tokens = stats["total_tokens_in"] + stats["total_tokens_out"]
+            _now = now_th()
+            next_reset = _now.replace(hour=7, minute=0, second=0, microsecond=0)
+            if _now >= next_reset:
+                next_reset += datetime.timedelta(days=1)
+            time_to_reset = next_reset - _now
+            reset_h, reset_rem = divmod(int(time_to_reset.total_seconds()), 3600)
+            reset_m = reset_rem // 60
             await message.reply(
                 f"📊 **Stats**\n"
                 f"• Req: `{stats['total_requests']}` / 1,500\n"
@@ -380,7 +440,9 @@ async def on_message(message):
                 f"• Reactions: `{stats['total_reactions']}`\n"
                 f"• Images: `{stats['total_images']}`\n"
                 f"• Sessions: `{len(chat_sessions)}` users\n"
-                f"• API Keys: `{len(API_KEYS)}` key(s)"
+                f"• API Keys: `{len(API_KEYS)}` key(s)\n"
+                f"• เวลาไทย: `{now_th().strftime('%d/%m/%Y %H:%M')} น.`\n"
+                f"• รีเซตถัดไป: `{next_reset.strftime('%d/%m/%Y %H:%M')} น.` (อีก {reset_h}h {reset_m}m)"
             )
             return
 
