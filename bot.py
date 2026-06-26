@@ -1,6 +1,5 @@
 import discord
-from google import genai
-from google.genai import types
+from groq import Groq, AuthenticationError, PermissionDeniedError, RateLimitError, APIConnectionError, APIStatusError
 import os
 import sys
 import datetime
@@ -12,8 +11,6 @@ from threading import Thread
 
 load_dotenv()
 
-# ทำให้ print() ออกมาทันที ไม่ถูกบัฟไว้ (สำคัญมากตอนรันบน Render/Railway ฯลฯ
-# ไม่งั้น log [INFO]/[ERROR]/[WARN] จะไม่โผล่ใน dashboard เลย เห็นแต่ log ของ Flask)
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
@@ -22,9 +19,9 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = 1005357318281641994
 
 API_KEYS = [k for k in [
-    os.getenv("GEMINI_API_KEY"),
-    os.getenv("GEMINI_API_KEY_2"),
-    os.getenv("GEMINI_API_KEY_3"),
+    os.getenv("GROQ_API_KEY"),
+    os.getenv("GROQ_API_KEY_2"),
+    os.getenv("GROQ_API_KEY_3"),
 ] if k]
 
 ALLOWED_CHANNELS = [
@@ -33,7 +30,11 @@ ALLOWED_CHANNELS = [
     1520009829924474973,
 ]
 
-MODEL_NAME = "gemini-2.0-flash-lite"
+MODEL_NAME = "llama-3.3-70b-versatile"
+REACT_MODEL_NAME = "llama-3.1-8b-instant"
+MAX_REPLY_TOKENS = 800
+HISTORY_LIMIT_PAIRS = 20
+
 TZ_OFFSET = datetime.timezone(datetime.timedelta(hours=7))
 
 SYSTEM_PROMPT = """
@@ -77,15 +78,13 @@ def now_th():
     return datetime.datetime.now(TZ_OFFSET)
 
 
-def get_client(key: str) -> genai.Client:
-    """สร้าง genai.Client ใหม่ทุกครั้ง (เบามาก ไม่ต้องมี lock เหมือน SDK เก่า
-    เพราะ google-genai ไม่ใช้ global config แล้ว แต่ละ Client มี state ของตัวเอง)"""
-    return genai.Client(api_key=key)
+def get_client(key: str) -> Groq:
+    return Groq(api_key=key)
 
 
-chat_sessions = {}
-exhausted_keys = set()   # key ที่ daily quota หมด (จะเคลียร์ทุกวันตอน 07:00)
-invalid_keys = set()     # key ที่ผิด/ใช้ไม่ได้จริง (ไม่เคลียร์อัตโนมัติ ต้องแก้ env แล้ว redeploy)
+user_histories = {}
+exhausted_keys = set()
+invalid_keys = set()
 processing_users = set()
 react_cooldown = {}
 REACT_COOLDOWN_SEC = 10
@@ -95,7 +94,6 @@ stats = {
     "total_tokens_in": 0,
     "total_tokens_out": 0,
     "total_reactions": 0,
-    "total_images": 0,
     "start_time": now_th(),
     "last_reset": now_th(),
 }
@@ -106,17 +104,16 @@ intents.members = True
 client = discord.Client(intents=intents)
 
 
-def get_or_create_chat(user_id: int, key_index: int):
-    existing = chat_sessions.get(user_id)
-    if existing and existing[0] == key_index:
-        return existing[1]
-    client_obj = get_client(API_KEYS[key_index])
-    chat = client_obj.chats.create(
-        model=MODEL_NAME,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-    )
-    chat_sessions[user_id] = (key_index, chat)
-    return chat
+def get_history(user_id: int) -> list:
+    if user_id not in user_histories:
+        user_histories[user_id] = []
+    return user_histories[user_id]
+
+
+def trim_history(history: list):
+    max_messages = HISTORY_LIMIT_PAIRS * 2
+    if len(history) > max_messages:
+        del history[: len(history) - max_messages]
 
 
 def count_tokens(text):
@@ -126,58 +123,9 @@ def count_tokens(text):
         return 0
 
 
-def is_daily_quota_error(msg: str) -> bool:
-    msg_lower = msg.lower()
-    return any(x in msg_lower for x in [
-        "per_day", "perday", "daily", "quota exceeded",
-        "generaterequestsperdayperproject",
-        "resource_exhausted",
-    ]) or (
-        "429" in msg
-        and "per_minute" not in msg_lower
-        and "perminute" not in msg_lower
-    )
-
-
-def is_zero_quota_unverified_error(msg: str) -> bool:
-    """limit: 0 = โปรเจกต์/บัญชียังไม่ผูก billing เลยถูกจัดอยู่ใน free-tier bucket ที่ลิมิตเป็น 0
-    ไม่ใช่ quota ที่ใช้จนหมดแบบปกติ ต้องไปผูก billing ใน AI Studio/Cloud Console ก่อน"""
-    return "limit: 0" in msg or "limit:0" in msg.replace(" ", "")
-
-
-def is_invalid_key_error(msg: str) -> bool:
-    msg_lower = msg.lower()
-    return (
-        "api_key_invalid" in msg_lower
-        or "api key not valid" in msg_lower
-        or "access_token_type_unsupported" in msg_lower
-        or "unauthenticated" in msg_lower
-        or ("invalid" in msg_lower and "key" in msg_lower)
-        or "401" in msg
-        or "403" in msg
-        or "permission_denied" in msg_lower
-    )
-
-
-def parse_error(e: Exception) -> str:
-    msg = str(e)
-    if is_invalid_key_error(msg):
-        return "❌ API key ไม่ถูกต้อง/ไม่มีสิทธิ์ใช้งานอ่ะ ลองติดต่อท่านเซนนะ (เซนพิมพ์ `!testkeys` เพื่อเช็คได้เลย)"
-    if "429" in msg:
-        if is_zero_quota_unverified_error(msg):
-            return "❌ บัญชียังไม่ผูก billing บน AI Studio เลย quota free tier เป็น 0 อยู่อ่ะ ต้องให้ท่านเซนไปผูก billing ก่อนนะ"
-        if is_daily_quota_error(msg):
-            return "❌ quota วันนี้หมดแล้วอ่ะ รอรีเซตตอน 07:00 น. (UTC+7) นะ 🙏"
-        if "per_minute" in msg.lower() or "PerMinute" in msg or "GenerateRequestsPerMinute" in msg:
-            return "⏳ request เยอะเกินต่อนาทีอ่ะ รอแป๊บนึงแล้วลองใหม่นะ"
-        if "token" in msg.lower():
-            return "⏳ ส่ง token เยอะเกินไปอ่ะ ลองพิมพ์สั้นลงหน่อยได้มั้ย"
-        return "❌ quota หมดอ่ะ รอแป๊บนึงแล้วลองใหม่นะ 🙏"
-    if "400" in msg:
-        return "❌ ข้อความนี้บอทรับไม่ได้อ่ะ ลองใหม่ด้วยข้อความอื่นนะ"
-    if "500" in msg or "503" in msg:
-        return "❌ server Gemini มีปัญหาอ่ะ รอแป๊บแล้วลองใหม่นะ"
-    return f"❌ เกิด error อ่ะ: `{msg[:200]}`"
+def is_daily_quota_error(e: RateLimitError) -> bool:
+    msg = str(e).lower()
+    return "rpd" in msg or "requests per day" in msg or "daily" in msg
 
 
 def get_active_key_index():
@@ -187,8 +135,21 @@ def get_active_key_index():
     return None
 
 
+def parse_error(e: Exception) -> str:
+    if isinstance(e, (AuthenticationError, PermissionDeniedError)):
+        return "❌ API key ไม่ถูกต้อง/ไม่มีสิทธิ์ใช้งานอ่ะ ลองติดต่อท่านเซนนะ (เซนพิมพ์ `!testkeys` เพื่อเช็คได้เลย)"
+    if isinstance(e, RateLimitError):
+        if is_daily_quota_error(e):
+            return "❌ quota วันนี้หมดแล้วอ่ะ รอรีเซตตอน 07:00 น. (UTC+7) นะ 🙏"
+        return "⏳ request เยอะเกินอ่ะ รอแป๊บนึงแล้วลองใหม่นะ"
+    if isinstance(e, APIConnectionError):
+        return "❌ เชื่อมต่อ Groq ไม่ได้อ่ะ เน็ตอาจมีปัญหา ลองใหม่อีกทีนะ"
+    if isinstance(e, APIStatusError):
+        return f"❌ เกิด error จาก Groq อ่ะ (status {e.status_code})"
+    return f"❌ เกิด error อ่ะ: `{str(e)[:200]}`"
+
+
 async def auto_react(message):
-    """ให้ AI เลือก emoji เอง — silent fail ไม่ blacklist key"""
     try:
         if len(message.content.strip()) < 2:
             return
@@ -200,15 +161,17 @@ async def auto_react(message):
         if key_index is None:
             return
 
-        key = API_KEYS[key_index]
-        client_obj = get_client(key)
+        client_obj = get_client(API_KEYS[key_index])
         response = await asyncio.to_thread(
-            client_obj.models.generate_content,
-            model=MODEL_NAME,
-            contents=message.content[:300],
-            config=types.GenerateContentConfig(system_instruction=REACT_SYSTEM_PROMPT),
+            client_obj.chat.completions.create,
+            model=REACT_MODEL_NAME,
+            messages=[
+                {"role": "system", "content": REACT_SYSTEM_PROMPT},
+                {"role": "user", "content": message.content[:300]},
+            ],
+            max_tokens=10,
         )
-        emoji = response.text.strip()
+        emoji = response.choices[0].message.content.strip()
 
         if emoji and emoji != "NONE" and len(emoji) <= 8:
             await message.add_reaction(emoji)
@@ -217,18 +180,10 @@ async def auto_react(message):
             print(f"[REACT] '{message.content[:30]}' → {emoji}", flush=True)
 
     except Exception as e:
-        # silent fail — ไม่ blacklist key ไม่ crash
         print(f"[REACT ERROR] {e}", flush=True)
 
 
-async def generate_image(prompt):
-    encoded = prompt.replace(" ", "%20")
-    return f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true"
-
-
 async def _keep_typing(channel):
-    """ใช้ channel.typing() context manager แทน trigger_typing() ที่ถูกถอดออกจาก
-    discord.py แล้ว (เป็นสาเหตุของ '[TYPING ERROR] ... has no attribute trigger_typing')"""
     try:
         async with channel.typing():
             while True:
@@ -239,7 +194,7 @@ async def _keep_typing(channel):
         print(f"[TYPING ERROR] {e}", flush=True)
 
 
-async def process_message(message, user_input, image_data=None):
+async def process_message(message, user_input):
     if message.author.id in processing_users:
         print(f"[SKIP] user {message.author.id} กำลัง process อยู่ → skip", flush=True)
         return
@@ -249,6 +204,8 @@ async def process_message(message, user_input, image_data=None):
 
     try:
         last_error = None
+        history = get_history(message.author.id)
+        history.append({"role": "user", "content": user_input})
 
         for key_index in range(len(API_KEYS)):
             if key_index in exhausted_keys or key_index in invalid_keys:
@@ -258,26 +215,19 @@ async def process_message(message, user_input, image_data=None):
                 key = API_KEYS[key_index]
                 print(f"[INFO] ลองใช้ key {key_index + 1}/{len(API_KEYS)} ({key[:8]}...)", flush=True)
 
-                if image_data:
-                    client_obj = get_client(key)
-                    parts = [
-                        user_input or "อธิบายรูปนี้ให้หน่อย",
-                        types.Part.from_bytes(data=image_data["data"], mime_type=image_data["mime_type"]),
-                    ]
-                    response = await asyncio.to_thread(
-                        client_obj.models.generate_content,
-                        model=MODEL_NAME,
-                        contents=parts,
-                        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-                    )
-                else:
-                    existing = chat_sessions.get(message.author.id)
-                    if existing and existing[0] != key_index:
-                        del chat_sessions[message.author.id]
-                    chat = get_or_create_chat(message.author.id, key_index)
-                    response = await asyncio.to_thread(chat.send_message, user_input)
+                client_obj = get_client(key)
+                messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+                response = await asyncio.to_thread(
+                    client_obj.chat.completions.create,
+                    model=MODEL_NAME,
+                    messages=messages,
+                    max_tokens=MAX_REPLY_TOKENS,
+                )
 
-                reply = response.text
+                reply = response.choices[0].message.content
+                history.append({"role": "assistant", "content": reply})
+                trim_history(history)
+
                 stats["total_requests"] += 1
                 stats["total_tokens_in"] += count_tokens(user_input or "")
                 stats["total_tokens_out"] += count_tokens(reply)
@@ -285,34 +235,32 @@ async def process_message(message, user_input, image_data=None):
                 await message.reply(reply[:1950] + "..." if len(reply) > 2000 else reply)
                 return
 
-            except Exception as e:
+            except (AuthenticationError, PermissionDeniedError) as e:
                 last_error = e
-                err_msg = str(e)
-                print(f"[ERROR] key {key_index + 1}: {err_msg[:500]}", flush=True)
+                invalid_keys.add(key_index)
+                remaining = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
+                print(f"[WARN] key {key_index + 1} ใช้ไม่ได้ (invalid/permission): {e} → ตัดออก ลอง key ถัดไป (เหลือ {remaining} key(s) ใช้ได้)", flush=True)
+                continue
 
-                if is_invalid_key_error(err_msg):
-                    invalid_keys.add(key_index)
+            except RateLimitError as e:
+                last_error = e
+                if is_daily_quota_error(e):
+                    exhausted_keys.add(key_index)
                     remaining = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
-                    print(f"[WARN] key {key_index + 1} ใช้ไม่ได้ (invalid/permission/401) → ตัดออก ลอง key ถัดไป (เหลือ {remaining} key(s) ใช้ได้)", flush=True)
+                    print(f"[WARN] key {key_index + 1} daily quota หมด → blacklist (เหลือ {remaining} key(s) ใช้ได้)", flush=True)
+                    continue
+                else:
+                    print(f"[WARN] key {key_index + 1} rate limit ต่อนาที/วินาที → รอ 3s", flush=True)
+                    await asyncio.sleep(3)
                     continue
 
-                if "429" in err_msg:
-                    if is_zero_quota_unverified_error(err_msg):
-                        invalid_keys.add(key_index)
-                        print(f"[WARN] key {key_index + 1} limit:0 (บัญชียังไม่ผูก billing) → ตัดออก ลอง key ถัดไป", flush=True)
-                        continue
-                    if is_daily_quota_error(err_msg):
-                        exhausted_keys.add(key_index)
-                        remaining = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
-                        print(f"[WARN] key {key_index + 1} daily quota หมด → blacklist (เหลือ {remaining} key(s) ใช้ได้)", flush=True)
-                        continue
-                    else:
-                        print(f"[WARN] key {key_index + 1} rate limit ต่อนาที → รอ 3s", flush=True)
-                        await asyncio.sleep(3)
-                        continue
-
-                # error อื่นๆที่ไม่เกี่ยวกับ key (เช่น 400 เนื้อหาไม่ผ่าน, 500/503 server) ไม่ต้องลอง key อื่นต่อ
+            except (APIConnectionError, APIStatusError, Exception) as e:
+                last_error = e
+                print(f"[ERROR] key {key_index + 1}: {str(e)[:500]}", flush=True)
                 break
+
+        if history and history[-1]["role"] == "user":
+            history.pop()
 
         if last_error:
             await message.reply(parse_error(last_error))
@@ -324,7 +272,6 @@ async def process_message(message, user_input, image_data=None):
 
 
 async def test_all_keys() -> str:
-    """ทดสอบทุก key สดๆ แล้วคืนผลลัพธ์เป็น string สำหรับโอนเนอร์"""
     if not API_KEYS:
         return "⚠️ ไม่มี API key ตั้งไว้ใน env เลยอ่ะ"
 
@@ -334,29 +281,26 @@ async def test_all_keys() -> str:
         try:
             client_obj = get_client(key)
             response = await asyncio.to_thread(
-                client_obj.models.generate_content,
+                client_obj.chat.completions.create,
                 model=MODEL_NAME,
-                contents="ping",
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=5,
             )
-            _ = response.text
+            _ = response.choices[0].message.content
             status = "✅ ใช้งานได้"
             invalid_keys.discard(i)
             if i in exhausted_keys:
                 status += " (แต่ก่อนหน้านี้โดน mark ว่า quota หมด ไม่ได้แก้อัตโนมัตินะ)"
-        except Exception as e:
-            err = str(e)
-            if is_invalid_key_error(err):
-                status = f"❌ ใช้ไม่ได้ (invalid/permission/401): `{err[:150]}`"
-                invalid_keys.add(i)
-            elif "429" in err and is_zero_quota_unverified_error(err):
-                status = f"⚠️ limit:0 — บัญชียังไม่ผูก billing บน AI Studio: `{err[:150]}`"
-                invalid_keys.add(i)
-            elif "429" in err and is_daily_quota_error(err):
-                status = f"⚠️ quota วันนี้หมด: `{err[:150]}`"
-            elif "429" in err:
-                status = f"⏳ rate limit ต่อนาที (key ใช้ได้ แต่ชนลิมิตชั่วคราว): `{err[:150]}`"
+        except (AuthenticationError, PermissionDeniedError) as e:
+            status = f"❌ ใช้ไม่ได้ (invalid/permission): `{str(e)[:150]}`"
+            invalid_keys.add(i)
+        except RateLimitError as e:
+            if is_daily_quota_error(e):
+                status = f"⚠️ quota วันนี้หมด: `{str(e)[:150]}`"
             else:
-                status = f"❌ error อื่น: `{err[:150]}`"
+                status = f"⏳ rate limit ต่อนาที (key ใช้ได้ แต่ชนลิมิตชั่วคราว): `{str(e)[:150]}`"
+        except Exception as e:
+            status = f"❌ error อื่น: `{str(e)[:150]}`"
         lines.append(f"**{label}** — {status}")
 
     return "\n".join(lines)
@@ -381,12 +325,10 @@ async def reset_daily_stats():
         stats["total_tokens_in"] = 0
         stats["total_tokens_out"] = 0
         stats["total_reactions"] = 0
-        stats["total_images"] = 0
         stats["last_reset"] = now_th()
-        chat_sessions.clear()
+        user_histories.clear()
         exhausted_keys.clear()
         processing_users.clear()
-        # invalid_keys ไม่เคลียร์อัตโนมัติ เพราะเป็นปัญหา key ผิดจริง/บัญชียังไม่ verify ไม่ใช่ quota รายวัน
         print(f"[RESET] ✅ รีเซตแล้ว! ({stats['last_reset'].strftime('%d/%m/%Y %H:%M')} น.)", flush=True)
 
 
@@ -414,12 +356,6 @@ def home():
     next_reset_str = next_reset.strftime("%d/%m/%Y %H:%M")
 
     total_tokens = stats["total_tokens_in"] + stats["total_tokens_out"]
-    daily_token_limit = 1_000_000
-    daily_req_limit = 1_500
-    token_percent = min(round((total_tokens / daily_token_limit) * 100, 2), 100)
-    req_percent = min(round((stats["total_requests"] / daily_req_limit) * 100, 2), 100)
-    req_color = "#00ff88" if req_percent < 70 else "#ffd700" if req_percent < 90 else "#ff4444"
-    tok_color = "#00ff88" if token_percent < 70 else "#ffd700" if token_percent < 90 else "#ff4444"
     active_keys = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
 
     html = f"""<!DOCTYPE html>
@@ -451,10 +387,6 @@ def home():
         .card-value {{ font-size: 1.6rem; font-weight: 700; color: #f1f5f9; line-height: 1; }}
         .card-sub {{ font-size: 0.78rem; color: #475569; margin-top: 4px; }}
         .card-icon {{ font-size: 1.1rem; margin-bottom: 6px; }}
-        .bar-wrap {{ margin-top: 12px; }}
-        .bar-header {{ display: flex; justify-content: space-between; font-size: 0.75rem; color: #64748b; margin-bottom: 6px; }}
-        .bar-bg {{ background: #1e1e30; border-radius: 999px; height: 8px; overflow: hidden; }}
-        .bar-fill {{ height: 100%; border-radius: 999px; transition: width 0.5s ease; }}
         .model-card {{ background: linear-gradient(135deg, #1a1a2e, #16162a); border: 1px solid #312e6b; border-radius: 16px; padding: 20px; margin-bottom: 14px; display: flex; align-items: center; gap: 16px; }}
         .model-icon {{ width: 44px; height: 44px; background: linear-gradient(135deg, #4f46e5, #7c3aed); border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 22px; flex-shrink: 0; }}
         .model-name {{ font-weight: 700; font-size: 1rem; color: #c4b5fd; }}
@@ -484,8 +416,8 @@ def home():
         <div class="time-chip">⏳ รีเซตถัดไป: <span>{next_reset_str} น.</span> (อีก {reset_h}h {reset_m}m)</div>
     </div>
     <div class="model-card">
-        <div class="model-icon">✨</div>
-        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + AI React + Image Gen</div></div>
+        <div class="model-icon">⚡</div>
+        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Groq (LPU) — Chat + AI React</div></div>
         <div class="model-badge">Free Tier · {len(API_KEYS)} key(s) · {active_keys} active</div>
     </div>
     <div class="grid">
@@ -493,21 +425,13 @@ def home():
             <div class="card-icon">📨</div>
             <div class="card-label">Requests Today</div>
             <div class="card-value">{stats["total_requests"]}</div>
-            <div class="card-sub">จาก {daily_req_limit:,} req/วัน</div>
-            <div class="bar-wrap">
-                <div class="bar-header"><span>{req_percent}% used</span><span>{daily_req_limit - stats["total_requests"]:,} เหลือ</span></div>
-                <div class="bar-bg"><div class="bar-fill" style="width:{req_percent}%;background:{req_color}"></div></div>
-            </div>
+            <div class="card-sub">เช็คโควต้าจริงที่ console.groq.com</div>
         </div>
         <div class="card">
             <div class="card-icon">🪙</div>
-            <div class="card-label">Tokens Today</div>
+            <div class="card-label">Tokens Today (ประมาณ)</div>
             <div class="card-value">{total_tokens:,}</div>
-            <div class="card-sub">จาก {daily_token_limit:,} tokens/วัน</div>
-            <div class="bar-wrap">
-                <div class="bar-header"><span>{token_percent}% used</span><span>{daily_token_limit - total_tokens:,} เหลือ</span></div>
-                <div class="bar-bg"><div class="bar-fill" style="width:{token_percent}%;background:{tok_color}"></div></div>
-            </div>
+            <div class="card-sub">คำนวณคร่าวๆจากความยาวข้อความ</div>
         </div>
         <div class="card">
             <div class="card-icon">😄</div>
@@ -516,35 +440,21 @@ def home():
             <div class="card-sub">AI เลือก emoji เองตามบริบท</div>
         </div>
         <div class="card">
-            <div class="card-icon">🎨</div>
-            <div class="card-label">Images Generated</div>
-            <div class="card-value">{stats["total_images"]}</div>
-            <div class="card-sub">Pollinations AI</div>
-        </div>
-        <div class="card">
-            <div class="card-icon">📥</div>
-            <div class="card-label">Input Tokens</div>
-            <div class="card-value">{stats["total_tokens_in"]:,}</div>
-            <div class="card-sub">จากข้อความผู้ใช้</div>
-        </div>
-        <div class="card">
-            <div class="card-icon">📤</div>
-            <div class="card-label">Output Tokens</div>
-            <div class="card-value">{stats["total_tokens_out"]:,}</div>
-            <div class="card-sub">จากคำตอบบอท</div>
+            <div class="card-icon">💬</div>
+            <div class="card-label">Active Sessions</div>
+            <div class="card-value">{len(user_histories)}</div>
+            <div class="card-sub">ผู้ใช้ที่มีประวัติแชทอยู่</div>
         </div>
     </div>
     <div class="limits-card">
-        <div class="limits-title">⚡ Free Tier Rate Limits (ต่อ key)</div>
-        <div class="limit-row"><span class="limit-label">Requests / นาที</span><span class="limit-val">15 RPM</span></div>
-        <div class="limit-row"><span class="limit-label">Requests / วัน</span><span class="limit-val">1,500 RPD</span></div>
-        <div class="limit-row"><span class="limit-label">Tokens / นาที</span><span class="limit-val">250,000 TPM</span></div>
-        <div class="limit-row"><span class="limit-label">Tokens / วัน</span><span class="limit-val">1,000,000 TPD</span></div>
+        <div class="limits-title">⚡ Groq Free Tier (เช็คจริงที่ console.groq.com/docs/rate-limits)</div>
+        <div class="limit-row"><span class="limit-label">Provider</span><span class="limit-val">Groq (LPU hardware)</span></div>
+        <div class="limit-row"><span class="limit-label">Chat model</span><span class="limit-val">{MODEL_NAME}</span></div>
+        <div class="limit-row"><span class="limit-label">React model</span><span class="limit-val">{REACT_MODEL_NAME}</span></div>
         <div class="limit-row"><span class="limit-label">API Keys ที่ใช้</span><span class="limit-val">{len(API_KEYS)} key(s)</span></div>
         <div class="limit-row"><span class="limit-label">Keys ที่ยัง active</span><span class="limit-val">{active_keys} key(s)</span></div>
         <div class="limit-row"><span class="limit-label">Keys quota หมด</span><span class="limit-val">{len(exhausted_keys)} key(s)</span></div>
         <div class="limit-row"><span class="limit-label">Keys invalid</span><span class="limit-val">{len(invalid_keys)} key(s)</span></div>
-        <div class="limit-row"><span class="limit-label">Active Sessions</span><span class="limit-val">{len(chat_sessions)} users</span></div>
         <div class="limit-row"><span class="limit-label">รีเซต stats อัตโนมัติ</span><span class="limit-val reset-badge">ทุกวัน 07:00 น. (UTC+7)</span></div>
     </div>
     <div class="footer">หน้านี้รีเฟรชอัตโนมัติทุก 30 วินาที • เวลาทั้งหมดเป็น UTC+7</div>
@@ -586,7 +496,7 @@ async def on_message(message):
 
     if message.author.id == OWNER_ID:
         if message.content == "!reset":
-            chat_sessions.pop(message.author.id, None)
+            user_histories.pop(message.author.id, None)
             await message.reply("🔄 รีเซตแชทแล้ว!")
             return
         if message.content == "!ping":
@@ -609,11 +519,10 @@ async def on_message(message):
             active_keys = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
             await message.reply(
                 f"📊 **Stats**\n"
-                f"• Req: `{stats['total_requests']}` / 1,500\n"
-                f"• Tokens: `{total_tokens:,}` / 1,000,000\n"
+                f"• Req: `{stats['total_requests']}`\n"
+                f"• Tokens (ประมาณ): `{total_tokens:,}`\n"
                 f"• Reactions: `{stats['total_reactions']}`\n"
-                f"• Images: `{stats['total_images']}`\n"
-                f"• Sessions: `{len(chat_sessions)}` users\n"
+                f"• Sessions: `{len(user_histories)}` users\n"
                 f"• API Keys: `{len(API_KEYS)}` key(s) · active: `{active_keys}` · quota หมด: `{len(exhausted_keys)}` · invalid: `{len(invalid_keys)}`\n"
                 f"• เวลาไทย: `{now_th().strftime('%d/%m/%Y %H:%M')} น.`\n"
                 f"• รีเซตถัดไป: `{next_reset.strftime('%d/%m/%Y %H:%M')} น.` (อีก {reset_h}h {reset_m}m)"
@@ -621,49 +530,25 @@ async def on_message(message):
             return
 
     if message.content == "!reset":
-        chat_sessions.pop(message.author.id, None)
+        user_histories.pop(message.author.id, None)
         await message.reply("🔄 รีเซตแชทของคุณแล้ว!")
         return
 
     if message.content == "!help":
         await message.reply(
             "**✨ SAI Bot — คำสั่งที่ใช้ได้**\n\n"
-            "`!gen <prompt>` — เจนรูปภาพ\n"
             "`!reset` — ล้างประวัติแชทของคุณ\n"
             "`!help` — แสดงคำสั่งนี้\n\n"
-            "หรือแค่พิมพ์ข้อความ/ส่งรูปมาได้เลย!\n"
+            "หรือแค่พิมพ์ข้อความมาได้เลย!\n"
             "บอทจะ react emoji ตามอารมณ์ข้อความอัตโนมัติด้วยนะ 😄"
         )
         return
 
-    if message.content.startswith("!gen "):
-        prompt = message.content[5:].strip()
-        if not prompt:
-            await message.reply("ใส่ prompt ด้วยนะ เช่น `!gen cute anime girl in forest`")
-            return
-        async with message.channel.typing():
-            img_url = await generate_image(prompt)
-            stats["total_images"] += 1
-            embed = discord.Embed(color=0x6366f1)
-            embed.set_image(url=img_url)
-            embed.set_footer(text=f"Prompt: {prompt[:100]}")
-            await message.reply(embed=embed)
-        return
-
     user_input = message.content.strip()
-
-    image_data = None
-    if message.attachments:
-        for att in message.attachments:
-            if any(att.filename.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
-                img_bytes = await att.read()
-                image_data = {"mime_type": "image/jpeg", "data": img_bytes}
-                break
-
-    if not user_input and not image_data:
+    if not user_input:
         return
 
-    await process_message(message, user_input, image_data)
+    await process_message(message, user_input)
 
 
 keep_alive()
