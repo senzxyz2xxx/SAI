@@ -67,16 +67,11 @@ REACT_SYSTEM_PROMPT = """
 """
 # ============================
 
+# lock กัน genai.configure() race condition
+genai_lock = asyncio.Lock()
+
 def now_th():
     return datetime.datetime.now(TZ_OFFSET)
-
-def make_model_with_key(key: str):
-    genai.configure(api_key=key)
-    return genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
-
-def make_react_model_with_key(key: str):
-    genai.configure(api_key=key)
-    return genai.GenerativeModel(MODEL_NAME, system_instruction=REACT_SYSTEM_PROMPT)
 
 chat_sessions = {}
 exhausted_keys = set()
@@ -100,11 +95,24 @@ intents.members = True
 client = discord.Client(intents=intents)
 
 
-def get_or_create_chat(user_id: int, key_index: int):
+async def make_chat_model(key: str):
+    """สร้าง chat model พร้อม lock กัน race"""
+    async with genai_lock:
+        genai.configure(api_key=key)
+        return genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
+
+async def make_react_model(key: str):
+    """สร้าง react model พร้อม lock กัน race"""
+    async with genai_lock:
+        genai.configure(api_key=key)
+        return genai.GenerativeModel(MODEL_NAME, system_instruction=REACT_SYSTEM_PROMPT)
+
+
+async def get_or_create_chat(user_id: int, key_index: int):
     existing = chat_sessions.get(user_id)
     if existing and existing[0] == key_index:
         return existing[1]
-    model = make_model_with_key(API_KEYS[key_index])
+    model = await make_chat_model(API_KEYS[key_index])
     chat = model.start_chat(history=[])
     chat_sessions[user_id] = (key_index, chat)
     return chat
@@ -127,7 +135,6 @@ def is_daily_quota_error(msg: str) -> bool:
         "429" in msg
         and "per_minute" not in msg_lower
         and "perminute" not in msg_lower
-        and "per_minute" not in msg_lower
     )
 
 
@@ -153,7 +160,6 @@ def parse_error(e: Exception) -> str:
 
 
 def get_active_key_index():
-    """หา key index แรกที่ยังไม่ exhausted"""
     for i in range(len(API_KEYS)):
         if i not in exhausted_keys:
             return i
@@ -161,7 +167,7 @@ def get_active_key_index():
 
 
 async def auto_react(message):
-    """ให้ AI เลือก emoji เองจากเนื้อหาข้อความ"""
+    """ให้ AI เลือก emoji เอง — silent fail ไม่ blacklist key"""
     try:
         if len(message.content.strip()) < 2:
             return
@@ -174,7 +180,7 @@ async def auto_react(message):
             return
 
         key = API_KEYS[key_index]
-        react_model = make_react_model_with_key(key)
+        react_model = await make_react_model(key)
         response = react_model.generate_content(message.content[:300])
         emoji = response.text.strip()
 
@@ -185,6 +191,7 @@ async def auto_react(message):
             print(f"[REACT] '{message.content[:30]}' → {emoji}")
 
     except Exception as e:
+        # silent fail — ไม่ blacklist key ไม่ crash
         print(f"[REACT ERROR] {e}")
 
 
@@ -194,7 +201,6 @@ async def generate_image(prompt):
 
 
 async def _keep_typing(channel):
-    """ส่ง typing indicator ทุก 8 วิ จนกว่าจะถูก cancel"""
     try:
         while True:
             await channel.trigger_typing()
@@ -225,15 +231,14 @@ async def process_message(message, user_input, image_data=None):
                 print(f"[INFO] ลองใช้ key {key_index + 1}/{len(API_KEYS)} ({key[:8]}...)")
 
                 if image_data:
-                    model = make_model_with_key(key)
+                    model = await make_chat_model(key)
                     parts = [user_input or "อธิบายรูปนี้ให้หน่อย", image_data]
                     response = model.generate_content(parts)
                 else:
-                    # ถ้า key เปลี่ยน ล้าง session เก่าทิ้ง
                     existing = chat_sessions.get(message.author.id)
                     if existing and existing[0] != key_index:
                         del chat_sessions[message.author.id]
-                    chat = get_or_create_chat(message.author.id, key_index)
+                    chat = await get_or_create_chat(message.author.id, key_index)
                     response = chat.send_message(user_input)
 
                 reply = response.text
