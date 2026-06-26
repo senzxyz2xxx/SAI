@@ -1,6 +1,7 @@
 import discord
 import google.generativeai as genai
 import os
+import sys
 import datetime
 import random
 import time
@@ -10,6 +11,11 @@ from flask import Flask
 from threading import Thread
 
 load_dotenv()
+
+# ทำให้ print() ออกมาทันที ไม่ถูกบัฟไว้ (สำคัญมากตอนรันบน Render/Railway ฯลฯ
+# ไม่งั้น log [INFO]/[ERROR]/[WARN] จะไม่โผล่ใน dashboard เลย เห็นแต่ log ของ Flask)
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 # ========== CONFIG ==========
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -74,7 +80,8 @@ def now_th():
     return datetime.datetime.now(TZ_OFFSET)
 
 chat_sessions = {}
-exhausted_keys = set()
+exhausted_keys = set()   # key ที่ daily quota หมด (จะเคลียร์ทุกวันตอน 07:00)
+invalid_keys = set()     # key ที่ผิด/ใช้ไม่ได้จริง (ไม่เคลียร์อัตโนมัติ ต้องแก้ env แล้ว redeploy)
 processing_users = set()
 react_cooldown = {}
 REACT_COOLDOWN_SEC = 10
@@ -138,6 +145,17 @@ def is_daily_quota_error(msg: str) -> bool:
     )
 
 
+def is_invalid_key_error(msg: str) -> bool:
+    msg_lower = msg.lower()
+    return (
+        "api_key_invalid" in msg_lower
+        or "api key not valid" in msg_lower
+        or ("invalid" in msg_lower and "key" in msg_lower)
+        or "403" in msg
+        or "permission_denied" in msg_lower
+    )
+
+
 def parse_error(e: Exception) -> str:
     msg = str(e)
     if "429" in msg:
@@ -150,18 +168,16 @@ def parse_error(e: Exception) -> str:
         return "❌ quota หมดอ่ะ รอแป๊บนึงแล้วลองใหม่นะ 🙏"
     if "400" in msg:
         return "❌ ข้อความนี้บอทรับไม่ได้อ่ะ ลองใหม่ด้วยข้อความอื่นนะ"
-    if "403" in msg:
-        return "❌ API key ไม่มีสิทธิ์ใช้งาน ลองติดต่อท่านเซนนะ"
+    if is_invalid_key_error(msg):
+        return "❌ API key ไม่ถูกต้อง/ไม่มีสิทธิ์ใช้งานอ่ะ ลองติดต่อท่านเซนนะ (เซนพิมพ์ `!testkeys` เพื่อเช็คได้เลย)"
     if "500" in msg or "503" in msg:
         return "❌ server Gemini มีปัญหาอ่ะ รอแป๊บแล้วลองใหม่นะ"
-    if "invalid" in msg.lower() and "key" in msg.lower():
-        return "❌ API key ไม่ถูกต้องอ่ะ ลองติดต่อท่านเซนนะ"
     return f"❌ เกิด error อ่ะ: `{msg[:200]}`"
 
 
 def get_active_key_index():
     for i in range(len(API_KEYS)):
-        if i not in exhausted_keys:
+        if i not in exhausted_keys and i not in invalid_keys:
             return i
     return None
 
@@ -188,11 +204,11 @@ async def auto_react(message):
             await message.add_reaction(emoji)
             react_cooldown[message.author.id] = now
             stats["total_reactions"] += 1
-            print(f"[REACT] '{message.content[:30]}' → {emoji}")
+            print(f"[REACT] '{message.content[:30]}' → {emoji}", flush=True)
 
     except Exception as e:
         # silent fail — ไม่ blacklist key ไม่ crash
-        print(f"[REACT ERROR] {e}")
+        print(f"[REACT ERROR] {e}", flush=True)
 
 
 async def generate_image(prompt):
@@ -208,12 +224,12 @@ async def _keep_typing(channel):
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        print(f"[TYPING ERROR] {e}")
+        print(f"[TYPING ERROR] {e}", flush=True)
 
 
 async def process_message(message, user_input, image_data=None):
     if message.author.id in processing_users:
-        print(f"[SKIP] user {message.author.id} กำลัง process อยู่ → skip")
+        print(f"[SKIP] user {message.author.id} กำลัง process อยู่ → skip", flush=True)
         return
     processing_users.add(message.author.id)
 
@@ -223,12 +239,12 @@ async def process_message(message, user_input, image_data=None):
         last_error = None
 
         for key_index in range(len(API_KEYS)):
-            if key_index in exhausted_keys:
+            if key_index in exhausted_keys or key_index in invalid_keys:
                 continue
 
             try:
                 key = API_KEYS[key_index]
-                print(f"[INFO] ลองใช้ key {key_index + 1}/{len(API_KEYS)} ({key[:8]}...)")
+                print(f"[INFO] ลองใช้ key {key_index + 1}/{len(API_KEYS)} ({key[:8]}...)", flush=True)
 
                 if image_data:
                     model = await make_chat_model(key)
@@ -252,26 +268,71 @@ async def process_message(message, user_input, image_data=None):
             except Exception as e:
                 last_error = e
                 err_msg = str(e)
-                print(f"[ERROR] key {key_index + 1}: {err_msg[:300]}")
+                print(f"[ERROR] key {key_index + 1}: {err_msg[:500]}", flush=True)
 
                 if "429" in err_msg:
                     if is_daily_quota_error(err_msg):
                         exhausted_keys.add(key_index)
-                        remaining = len(API_KEYS) - len(exhausted_keys)
-                        print(f"[WARN] key {key_index + 1} daily quota หมด → blacklist (เหลือ {remaining} key(s))")
+                        remaining = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
+                        print(f"[WARN] key {key_index + 1} daily quota หมด → blacklist (เหลือ {remaining} key(s) ใช้ได้)", flush=True)
                         continue
                     else:
-                        print(f"[WARN] key {key_index + 1} rate limit → รอ 3s")
+                        print(f"[WARN] key {key_index + 1} rate limit ต่อนาที → รอ 3s", flush=True)
                         await asyncio.sleep(3)
                         continue
 
+                if is_invalid_key_error(err_msg):
+                    invalid_keys.add(key_index)
+                    remaining = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
+                    print(f"[WARN] key {key_index + 1} ใช้ไม่ได้ (invalid/permission) → ตัดออก ลอง key ถัดไป (เหลือ {remaining} key(s) ใช้ได้)", flush=True)
+                    continue
+
+                # error อื่นๆที่ไม่เกี่ยวกับ key (เช่น 400 เนื้อหาไม่ผ่าน, 500/503 server) ไม่ต้องลอง key อื่นต่อ
                 break
 
         if last_error:
             await message.reply(parse_error(last_error))
+        elif key_index_all_blocked := (get_active_key_index() is None):
+            await message.reply("❌ ตอนนี้ไม่มี API key ที่ใช้งานได้เลยอ่ะ ลองติดต่อท่านเซนนะ (เซนพิมพ์ `!testkeys` เพื่อเช็คได้เลย)")
     finally:
         typing_task.cancel()
         processing_users.discard(message.author.id)
+
+
+async def test_all_keys() -> str:
+    """ทดสอบทุก key สดๆ แล้วคืนผลลัพธ์เป็น string สำหรับโอนเนอร์"""
+    if not API_KEYS:
+        return "⚠️ ไม่มี API key ตั้งไว้ใน env เลยอ่ะ"
+
+    lines = []
+    for i, key in enumerate(API_KEYS):
+        label = f"Key {i + 1} ({key[:8]}...)"
+        try:
+            async with genai_lock:
+                genai.configure(api_key=key)
+                model = genai.GenerativeModel(MODEL_NAME)
+            # เรียกจริงแบบเบาที่สุด เพื่อยืนยันว่า key ใช้ได้
+            response = await asyncio.to_thread(model.generate_content, "ping")
+            _ = response.text
+            status = "✅ ใช้งานได้"
+            if i in invalid_keys:
+                invalid_keys.discard(i)
+            if i in exhausted_keys:
+                status += " (แต่ก่อนหน้านี้โดน mark ว่า quota หมด ไม่ได้แก้อัตโนมัตินะ)"
+        except Exception as e:
+            err = str(e)
+            if is_invalid_key_error(err):
+                status = f"❌ ใช้ไม่ได้ (invalid/permission): `{err[:150]}`"
+                invalid_keys.add(i)
+            elif "429" in err and is_daily_quota_error(err):
+                status = f"⚠️ quota วันนี้หมด: `{err[:150]}`"
+            elif "429" in err:
+                status = f"⏳ rate limit ต่อนาที (key ใช้ได้ แต่ชนลิมิตชั่วคราว): `{err[:150]}`"
+            else:
+                status = f"❌ error อื่น: `{err[:150]}`"
+        lines.append(f"**{label}** — {status}")
+
+    return "\n".join(lines)
 
 
 # =======================
@@ -286,7 +347,7 @@ async def reset_daily_stats():
             next_reset += datetime.timedelta(days=1)
 
         wait_seconds = (next_reset - now).total_seconds()
-        print(f"[RESET] จะรีเซตในอีก {wait_seconds/3600:.1f}h (ตอน {next_reset.strftime('%d/%m/%Y %H:%M')} น.)")
+        print(f"[RESET] จะรีเซตในอีก {wait_seconds/3600:.1f}h (ตอน {next_reset.strftime('%d/%m/%Y %H:%M')} น.)", flush=True)
         await asyncio.sleep(wait_seconds)
 
         stats["total_requests"] = 0
@@ -298,7 +359,8 @@ async def reset_daily_stats():
         chat_sessions.clear()
         exhausted_keys.clear()
         processing_users.clear()
-        print(f"[RESET] ✅ รีเซตแล้ว! ({stats['last_reset'].strftime('%d/%m/%Y %H:%M')} น.)")
+        # invalid_keys ไม่เคลียร์อัตโนมัติ เพราะเป็นปัญหาที่ key ผิดจริง ไม่ใช่ quota
+        print(f"[RESET] ✅ รีเซตแล้ว! ({stats['last_reset'].strftime('%d/%m/%Y %H:%M')} น.)", flush=True)
 
 
 # =======================
@@ -331,6 +393,7 @@ def home():
     req_percent = min(round((stats["total_requests"] / daily_req_limit) * 100, 2), 100)
     req_color = "#00ff88" if req_percent < 70 else "#ffd700" if req_percent < 90 else "#ff4444"
     tok_color = "#00ff88" if token_percent < 70 else "#ffd700" if token_percent < 90 else "#ff4444"
+    active_keys = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
 
     html = f"""<!DOCTYPE html>
 <html lang="th">
@@ -396,7 +459,7 @@ def home():
     <div class="model-card">
         <div class="model-icon">✨</div>
         <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + AI React + Image Gen</div></div>
-        <div class="model-badge">Free Tier · {len(API_KEYS)} key(s) · {len(API_KEYS) - len(exhausted_keys)} active</div>
+        <div class="model-badge">Free Tier · {len(API_KEYS)} key(s) · {active_keys} active</div>
     </div>
     <div class="grid">
         <div class="card">
@@ -451,7 +514,9 @@ def home():
         <div class="limit-row"><span class="limit-label">Tokens / นาที</span><span class="limit-val">250,000 TPM</span></div>
         <div class="limit-row"><span class="limit-label">Tokens / วัน</span><span class="limit-val">1,000,000 TPD</span></div>
         <div class="limit-row"><span class="limit-label">API Keys ที่ใช้</span><span class="limit-val">{len(API_KEYS)} key(s)</span></div>
-        <div class="limit-row"><span class="limit-label">Keys ที่ยัง active</span><span class="limit-val">{len(API_KEYS) - len(exhausted_keys)} key(s)</span></div>
+        <div class="limit-row"><span class="limit-label">Keys ที่ยัง active</span><span class="limit-val">{active_keys} key(s)</span></div>
+        <div class="limit-row"><span class="limit-label">Keys quota หมด</span><span class="limit-val">{len(exhausted_keys)} key(s)</span></div>
+        <div class="limit-row"><span class="limit-label">Keys invalid</span><span class="limit-val">{len(invalid_keys)} key(s)</span></div>
         <div class="limit-row"><span class="limit-label">Active Sessions</span><span class="limit-val">{len(chat_sessions)} users</span></div>
         <div class="limit-row"><span class="limit-label">รีเซต stats อัตโนมัติ</span><span class="limit-val reset-badge">ทุกวัน 07:00 น. (UTC+7)</span></div>
     </div>
@@ -473,8 +538,8 @@ def keep_alive():
 
 @client.event
 async def on_ready():
-    print(f"✅ บอทออนไลน์แล้ว: {client.user} ({len(API_KEYS)} API key(s) โหลดแล้ว)")
-    print(f"🕐 เวลาไทยตอนนี้: {now_th().strftime('%d/%m/%Y %H:%M:%S')} น.")
+    print(f"✅ บอทออนไลน์แล้ว: {client.user} ({len(API_KEYS)} API key(s) โหลดแล้ว)", flush=True)
+    print(f"🕐 เวลาไทยตอนนี้: {now_th().strftime('%d/%m/%Y %H:%M:%S')} น.", flush=True)
     client.loop.create_task(reset_daily_stats())
 
 
@@ -500,6 +565,11 @@ async def on_message(message):
         if message.content == "!ping":
             await message.reply("🏓 Pong!")
             return
+        if message.content == "!testkeys":
+            async with message.channel.typing():
+                result = await test_all_keys()
+            await message.reply(f"🔑 **ผลทดสอบ API Keys**\n{result}")
+            return
         if message.content == "!stats":
             total_tokens = stats["total_tokens_in"] + stats["total_tokens_out"]
             _now = now_th()
@@ -509,6 +579,7 @@ async def on_message(message):
             time_to_reset = next_reset - _now
             reset_h, reset_rem = divmod(int(time_to_reset.total_seconds()), 3600)
             reset_m = reset_rem // 60
+            active_keys = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
             await message.reply(
                 f"📊 **Stats**\n"
                 f"• Req: `{stats['total_requests']}` / 1,500\n"
@@ -516,7 +587,7 @@ async def on_message(message):
                 f"• Reactions: `{stats['total_reactions']}`\n"
                 f"• Images: `{stats['total_images']}`\n"
                 f"• Sessions: `{len(chat_sessions)}` users\n"
-                f"• API Keys: `{len(API_KEYS)}` key(s) · active: `{len(API_KEYS) - len(exhausted_keys)}`\n"
+                f"• API Keys: `{len(API_KEYS)}` key(s) · active: `{active_keys}` · quota หมด: `{len(exhausted_keys)}` · invalid: `{len(invalid_keys)}`\n"
                 f"• เวลาไทย: `{now_th().strftime('%d/%m/%Y %H:%M')} น.`\n"
                 f"• รีเซตถัดไป: `{next_reset.strftime('%d/%m/%Y %H:%M')} น.` (อีก {reset_h}h {reset_m}m)"
             )
