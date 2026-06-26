@@ -90,7 +90,8 @@ def make_model_with_key(key: str):
 
 # chat_sessions เก็บ (key_index, chat_object) เพื่อรู้ว่า session นี้ใช้ key ไหนอยู่
 chat_sessions = {}
-exhausted_keys = set()  # key ที่ daily quota หมดแล้ว จะ clear ตอน 07:00 น.
+exhausted_keys = set()   # key ที่ daily quota หมดแล้ว จะ clear ตอน 07:00 น.
+processing_users = set() # กัน on_message trigger ซ้ำขณะกำลัง process อยู่
 react_cooldown = {}
 REACT_COOLDOWN_SEC = 10
 
@@ -173,59 +174,66 @@ async def generate_image(prompt):
 
 
 async def process_message(message, user_input, image_data=None):
-    async with message.channel.typing():
-        last_error = None
+    # ป้องกัน on_message trigger ซ้ำขณะ process อยู่
+    if message.author.id in processing_users:
+        return
+    processing_users.add(message.author.id)
+    try:
+        async with message.channel.typing():
+            last_error = None
 
-        for key_index in range(len(API_KEYS)):
-            # ข้าม key ที่ daily quota หมดแล้ว
-            if key_index in exhausted_keys:
-                continue
+            for key_index in range(len(API_KEYS)):
+                # ข้าม key ที่ daily quota หมดแล้ว
+                if key_index in exhausted_keys:
+                    continue
 
-            try:
-                key = API_KEYS[key_index]
-                print(f"[INFO] ลองใช้ key {key_index + 1}/{len(API_KEYS)} ({key[:8]}...)")
+                try:
+                    key = API_KEYS[key_index]
+                    print(f"[INFO] ลองใช้ key {key_index + 1}/{len(API_KEYS)} ({key[:8]}...)")
 
-                if image_data:
-                    # image ไม่ต้องการ chat session
-                    model = make_model_with_key(key)
-                    parts = [user_input or "อธิบายรูปนี้ให้หน่อย", image_data]
-                    response = model.generate_content(parts)
-                else:
-                    # ดึง/สร้าง chat session ที่ผูกกับ key นี้ชัดๆ
-                    chat = get_or_create_chat(message.author.id, key_index)
-                    response = chat.send_message(user_input)
-
-                reply = response.text
-                stats["total_requests"] += 1
-                stats["total_tokens_in"] += count_tokens(user_input or "")
-                stats["total_tokens_out"] += count_tokens(reply)
-
-                await message.reply(reply[:1950] + "..." if len(reply) > 2000 else reply)
-                return  # สำเร็จ → ออกเลย
-
-            except Exception as e:
-                last_error = e
-                err_msg = str(e)
-
-                if "429" in err_msg:
-                    if "per_day" in err_msg.lower() or "PerDay" in err_msg or "GenerateRequestsPerDay" in err_msg:
-                        # daily quota หมด → blacklist key นี้จนถึง 07:00 น.
-                        exhausted_keys.add(key_index)
-                        remaining = len(API_KEYS) - len(exhausted_keys)
-                        print(f"[WARN] key {key_index + 1} daily quota หมด → blacklist (เหลือ {remaining} key(s))")
-                        continue  # ลอง key ถัดไป
+                    if image_data:
+                        # image ไม่ต้องการ chat session
+                        model = make_model_with_key(key)
+                        parts = [user_input or "อธิบายรูปนี้ให้หน่อย", image_data]
+                        response = model.generate_content(parts)
                     else:
-                        # per_minute หรือ quota อื่น → รอแล้วลอง key เดิมซ้ำ
-                        print(f"[WARN] key {key_index + 1} rate limit hit → รอ 3s แล้วลองใหม่")
-                        await asyncio.sleep(3)
-                        continue
+                        # ดึง/สร้าง chat session ที่ผูกกับ key นี้ชัดๆ
+                        chat = get_or_create_chat(message.author.id, key_index)
+                        response = chat.send_message(user_input)
 
-                # error อื่น → หยุดเลย
-                break
+                    reply = response.text
+                    stats["total_requests"] += 1
+                    stats["total_tokens_in"] += count_tokens(user_input or "")
+                    stats["total_tokens_out"] += count_tokens(reply)
 
-        # reply error แค่ครั้งเดียว
-        if last_error:
-            await message.reply(parse_error(last_error))
+                    await message.reply(reply[:1950] + "..." if len(reply) > 2000 else reply)
+                    return  # สำเร็จ → ออกเลย
+
+                except Exception as e:
+                    last_error = e
+                    err_msg = str(e)
+
+                    if "429" in err_msg:
+                        if "per_day" in err_msg.lower() or "PerDay" in err_msg or "GenerateRequestsPerDay" in err_msg:
+                            # daily quota หมด → blacklist key นี้จนถึง 07:00 น.
+                            exhausted_keys.add(key_index)
+                            remaining = len(API_KEYS) - len(exhausted_keys)
+                            print(f"[WARN] key {key_index + 1} daily quota หมด → blacklist (เหลือ {remaining} key(s))")
+                            continue  # ลอง key ถัดไป
+                        else:
+                            # per_minute หรือ quota อื่น → รอแล้วลอง key เดิมซ้ำ
+                            print(f"[WARN] key {key_index + 1} rate limit hit → รอ 3s แล้วลองใหม่")
+                            await asyncio.sleep(3)
+                            continue
+
+                    # error อื่น → หยุดเลย
+                    break
+
+            # reply error แค่ครั้งเดียว
+            if last_error:
+                await message.reply(parse_error(last_error))
+    finally:
+        processing_users.discard(message.author.id)
 
 
 # =======================
