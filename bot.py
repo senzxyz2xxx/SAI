@@ -90,6 +90,7 @@ def make_model_with_key(key: str):
 
 # chat_sessions เก็บ (key_index, chat_object) เพื่อรู้ว่า session นี้ใช้ key ไหนอยู่
 chat_sessions = {}
+exhausted_keys = set()  # key ที่ daily quota หมดแล้ว จะ clear ตอน 07:00 น.
 react_cooldown = {}
 REACT_COOLDOWN_SEC = 10
 
@@ -176,6 +177,10 @@ async def process_message(message, user_input, image_data=None):
         last_error = None
 
         for key_index in range(len(API_KEYS)):
+            # ข้าม key ที่ daily quota หมดแล้ว
+            if key_index in exhausted_keys:
+                continue
+
             try:
                 key = API_KEYS[key_index]
                 print(f"[INFO] ลองใช้ key {key_index + 1}/{len(API_KEYS)} ({key[:8]}...)")
@@ -202,12 +207,20 @@ async def process_message(message, user_input, image_data=None):
                 last_error = e
                 err_msg = str(e)
 
-                if "429" in err_msg and key_index < len(API_KEYS) - 1:
-                    print(f"[WARN] key {key_index + 1} quota hit → switching to key {key_index + 2}")
-                    await asyncio.sleep(1)
-                    continue  # ลอง key ถัดไป
+                if "429" in err_msg:
+                    if "per_day" in err_msg.lower() or "PerDay" in err_msg or "GenerateRequestsPerDay" in err_msg:
+                        # daily quota หมด → blacklist key นี้จนถึง 07:00 น.
+                        exhausted_keys.add(key_index)
+                        remaining = len(API_KEYS) - len(exhausted_keys)
+                        print(f"[WARN] key {key_index + 1} daily quota หมด → blacklist (เหลือ {remaining} key(s))")
+                        continue  # ลอง key ถัดไป
+                    else:
+                        # per_minute หรือ quota อื่น → รอแล้วลอง key เดิมซ้ำ
+                        print(f"[WARN] key {key_index + 1} rate limit hit → รอ 3s แล้วลองใหม่")
+                        await asyncio.sleep(3)
+                        continue
 
-                # error อื่น หรือ key หมดทุกอัน
+                # error อื่น → หยุดเลย
                 break
 
         # reply error แค่ครั้งเดียว
@@ -237,7 +250,8 @@ async def reset_daily_stats():
         stats["total_reactions"] = 0
         stats["total_images"] = 0
         stats["last_reset"] = now_th()
-        chat_sessions.clear()  # clear sessions ด้วยเพื่อให้ key_index reset
+        chat_sessions.clear()   # clear sessions เพื่อให้ key_index reset
+        exhausted_keys.clear()  # unblacklist ทุก key พร้อมกัน
         print(f"[RESET] ✅ รีเซต daily stats แล้ว! ({stats['last_reset'].strftime('%d/%m/%Y %H:%M')} น.)")
 
 
@@ -336,7 +350,7 @@ def home():
     <div class="model-card">
         <div class="model-icon">✨</div>
         <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + Auto React + Image Gen</div></div>
-        <div class="model-badge">Free Tier · {len(API_KEYS)} key(s)</div>
+        <div class="model-badge">Free Tier · {len(API_KEYS)} key(s) · {len(API_KEYS) - len(exhausted_keys)} active</div>
     </div>
     <div class="grid">
         <div class="card">
@@ -391,6 +405,7 @@ def home():
         <div class="limit-row"><span class="limit-label">Tokens / นาที</span><span class="limit-val">250,000 TPM</span></div>
         <div class="limit-row"><span class="limit-label">Tokens / วัน</span><span class="limit-val">1,000,000 TPD</span></div>
         <div class="limit-row"><span class="limit-label">API Keys ที่ใช้</span><span class="limit-val">{len(API_KEYS)} key(s)</span></div>
+        <div class="limit-row"><span class="limit-label">Keys ที่ยัง active</span><span class="limit-val">{len(API_KEYS) - len(exhausted_keys)} key(s)</span></div>
         <div class="limit-row"><span class="limit-label">Active Sessions</span><span class="limit-val">{len(chat_sessions)} users</span></div>
         <div class="limit-row"><span class="limit-label">รีเซต stats อัตโนมัติ</span><span class="limit-val reset-badge">ทุกวัน 07:00 น. (UTC+7)</span></div>
     </div>
@@ -456,7 +471,7 @@ async def on_message(message):
                 f"• Reactions: `{stats['total_reactions']}`\n"
                 f"• Images: `{stats['total_images']}`\n"
                 f"• Sessions: `{len(chat_sessions)}` users\n"
-                f"• API Keys: `{len(API_KEYS)}` key(s)\n"
+                f"• API Keys: `{len(API_KEYS)}` key(s) · active: `{len(API_KEYS) - len(exhausted_keys)}`\n"
                 f"• เวลาไทย: `{now_th().strftime('%d/%m/%Y %H:%M')} น.`\n"
                 f"• รีเซตถัดไป: `{next_reset.strftime('%d/%m/%Y %H:%M')} น.` (อีก {reset_h}h {reset_m}m)"
             )
