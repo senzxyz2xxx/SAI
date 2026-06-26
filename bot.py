@@ -1,9 +1,9 @@
 import discord
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import os
 import sys
 import datetime
-import random
 import time
 import asyncio
 from dotenv import load_dotenv
@@ -73,11 +73,15 @@ REACT_SYSTEM_PROMPT = """
 """
 # ============================
 
-# lock กัน genai.configure() race condition
-genai_lock = asyncio.Lock()
-
 def now_th():
     return datetime.datetime.now(TZ_OFFSET)
+
+
+def get_client(key: str) -> genai.Client:
+    """สร้าง genai.Client ใหม่ทุกครั้ง (เบามาก ไม่ต้องมี lock เหมือน SDK เก่า
+    เพราะ google-genai ไม่ใช้ global config แล้ว แต่ละ Client มี state ของตัวเอง)"""
+    return genai.Client(api_key=key)
+
 
 chat_sessions = {}
 exhausted_keys = set()   # key ที่ daily quota หมด (จะเคลียร์ทุกวันตอน 07:00)
@@ -102,25 +106,15 @@ intents.members = True
 client = discord.Client(intents=intents)
 
 
-async def make_chat_model(key: str):
-    """สร้าง chat model พร้อม lock กัน race"""
-    async with genai_lock:
-        genai.configure(api_key=key)
-        return genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
-
-async def make_react_model(key: str):
-    """สร้าง react model พร้อม lock กัน race"""
-    async with genai_lock:
-        genai.configure(api_key=key)
-        return genai.GenerativeModel(MODEL_NAME, system_instruction=REACT_SYSTEM_PROMPT)
-
-
-async def get_or_create_chat(user_id: int, key_index: int):
+def get_or_create_chat(user_id: int, key_index: int):
     existing = chat_sessions.get(user_id)
     if existing and existing[0] == key_index:
         return existing[1]
-    model = await make_chat_model(API_KEYS[key_index])
-    chat = model.start_chat(history=[])
+    client_obj = get_client(API_KEYS[key_index])
+    chat = client_obj.chats.create(
+        model=MODEL_NAME,
+        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+    )
     chat_sessions[user_id] = (key_index, chat)
     return chat
 
@@ -145,12 +139,21 @@ def is_daily_quota_error(msg: str) -> bool:
     )
 
 
+def is_zero_quota_unverified_error(msg: str) -> bool:
+    """limit: 0 = โปรเจกต์/บัญชียังไม่ผูก billing เลยถูกจัดอยู่ใน free-tier bucket ที่ลิมิตเป็น 0
+    ไม่ใช่ quota ที่ใช้จนหมดแบบปกติ ต้องไปผูก billing ใน AI Studio/Cloud Console ก่อน"""
+    return "limit: 0" in msg or "limit:0" in msg.replace(" ", "")
+
+
 def is_invalid_key_error(msg: str) -> bool:
     msg_lower = msg.lower()
     return (
         "api_key_invalid" in msg_lower
         or "api key not valid" in msg_lower
+        or "access_token_type_unsupported" in msg_lower
+        or "unauthenticated" in msg_lower
         or ("invalid" in msg_lower and "key" in msg_lower)
+        or "401" in msg
         or "403" in msg
         or "permission_denied" in msg_lower
     )
@@ -158,7 +161,11 @@ def is_invalid_key_error(msg: str) -> bool:
 
 def parse_error(e: Exception) -> str:
     msg = str(e)
+    if is_invalid_key_error(msg):
+        return "❌ API key ไม่ถูกต้อง/ไม่มีสิทธิ์ใช้งานอ่ะ ลองติดต่อท่านเซนนะ (เซนพิมพ์ `!testkeys` เพื่อเช็คได้เลย)"
     if "429" in msg:
+        if is_zero_quota_unverified_error(msg):
+            return "❌ บัญชียังไม่ผูก billing บน AI Studio เลย quota free tier เป็น 0 อยู่อ่ะ ต้องให้ท่านเซนไปผูก billing ก่อนนะ"
         if is_daily_quota_error(msg):
             return "❌ quota วันนี้หมดแล้วอ่ะ รอรีเซตตอน 07:00 น. (UTC+7) นะ 🙏"
         if "per_minute" in msg.lower() or "PerMinute" in msg or "GenerateRequestsPerMinute" in msg:
@@ -168,8 +175,6 @@ def parse_error(e: Exception) -> str:
         return "❌ quota หมดอ่ะ รอแป๊บนึงแล้วลองใหม่นะ 🙏"
     if "400" in msg:
         return "❌ ข้อความนี้บอทรับไม่ได้อ่ะ ลองใหม่ด้วยข้อความอื่นนะ"
-    if is_invalid_key_error(msg):
-        return "❌ API key ไม่ถูกต้อง/ไม่มีสิทธิ์ใช้งานอ่ะ ลองติดต่อท่านเซนนะ (เซนพิมพ์ `!testkeys` เพื่อเช็คได้เลย)"
     if "500" in msg or "503" in msg:
         return "❌ server Gemini มีปัญหาอ่ะ รอแป๊บแล้วลองใหม่นะ"
     return f"❌ เกิด error อ่ะ: `{msg[:200]}`"
@@ -196,8 +201,13 @@ async def auto_react(message):
             return
 
         key = API_KEYS[key_index]
-        react_model = await make_react_model(key)
-        response = react_model.generate_content(message.content[:300])
+        client_obj = get_client(key)
+        response = await asyncio.to_thread(
+            client_obj.models.generate_content,
+            model=MODEL_NAME,
+            contents=message.content[:300],
+            config=types.GenerateContentConfig(system_instruction=REACT_SYSTEM_PROMPT),
+        )
         emoji = response.text.strip()
 
         if emoji and emoji != "NONE" and len(emoji) <= 8:
@@ -217,10 +227,12 @@ async def generate_image(prompt):
 
 
 async def _keep_typing(channel):
+    """ใช้ channel.typing() context manager แทน trigger_typing() ที่ถูกถอดออกจาก
+    discord.py แล้ว (เป็นสาเหตุของ '[TYPING ERROR] ... has no attribute trigger_typing')"""
     try:
-        while True:
-            await channel.trigger_typing()
-            await asyncio.sleep(8)
+        async with channel.typing():
+            while True:
+                await asyncio.sleep(8)
     except asyncio.CancelledError:
         pass
     except Exception as e:
@@ -247,15 +259,23 @@ async def process_message(message, user_input, image_data=None):
                 print(f"[INFO] ลองใช้ key {key_index + 1}/{len(API_KEYS)} ({key[:8]}...)", flush=True)
 
                 if image_data:
-                    model = await make_chat_model(key)
-                    parts = [user_input or "อธิบายรูปนี้ให้หน่อย", image_data]
-                    response = model.generate_content(parts)
+                    client_obj = get_client(key)
+                    parts = [
+                        user_input or "อธิบายรูปนี้ให้หน่อย",
+                        types.Part.from_bytes(data=image_data["data"], mime_type=image_data["mime_type"]),
+                    ]
+                    response = await asyncio.to_thread(
+                        client_obj.models.generate_content,
+                        model=MODEL_NAME,
+                        contents=parts,
+                        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+                    )
                 else:
                     existing = chat_sessions.get(message.author.id)
                     if existing and existing[0] != key_index:
                         del chat_sessions[message.author.id]
-                    chat = await get_or_create_chat(message.author.id, key_index)
-                    response = chat.send_message(user_input)
+                    chat = get_or_create_chat(message.author.id, key_index)
+                    response = await asyncio.to_thread(chat.send_message, user_input)
 
                 reply = response.text
                 stats["total_requests"] += 1
@@ -270,7 +290,17 @@ async def process_message(message, user_input, image_data=None):
                 err_msg = str(e)
                 print(f"[ERROR] key {key_index + 1}: {err_msg[:500]}", flush=True)
 
+                if is_invalid_key_error(err_msg):
+                    invalid_keys.add(key_index)
+                    remaining = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
+                    print(f"[WARN] key {key_index + 1} ใช้ไม่ได้ (invalid/permission/401) → ตัดออก ลอง key ถัดไป (เหลือ {remaining} key(s) ใช้ได้)", flush=True)
+                    continue
+
                 if "429" in err_msg:
+                    if is_zero_quota_unverified_error(err_msg):
+                        invalid_keys.add(key_index)
+                        print(f"[WARN] key {key_index + 1} limit:0 (บัญชียังไม่ผูก billing) → ตัดออก ลอง key ถัดไป", flush=True)
+                        continue
                     if is_daily_quota_error(err_msg):
                         exhausted_keys.add(key_index)
                         remaining = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
@@ -281,18 +311,12 @@ async def process_message(message, user_input, image_data=None):
                         await asyncio.sleep(3)
                         continue
 
-                if is_invalid_key_error(err_msg):
-                    invalid_keys.add(key_index)
-                    remaining = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
-                    print(f"[WARN] key {key_index + 1} ใช้ไม่ได้ (invalid/permission) → ตัดออก ลอง key ถัดไป (เหลือ {remaining} key(s) ใช้ได้)", flush=True)
-                    continue
-
                 # error อื่นๆที่ไม่เกี่ยวกับ key (เช่น 400 เนื้อหาไม่ผ่าน, 500/503 server) ไม่ต้องลอง key อื่นต่อ
                 break
 
         if last_error:
             await message.reply(parse_error(last_error))
-        elif key_index_all_blocked := (get_active_key_index() is None):
+        elif get_active_key_index() is None:
             await message.reply("❌ ตอนนี้ไม่มี API key ที่ใช้งานได้เลยอ่ะ ลองติดต่อท่านเซนนะ (เซนพิมพ์ `!testkeys` เพื่อเช็คได้เลย)")
     finally:
         typing_task.cancel()
@@ -308,21 +332,24 @@ async def test_all_keys() -> str:
     for i, key in enumerate(API_KEYS):
         label = f"Key {i + 1} ({key[:8]}...)"
         try:
-            async with genai_lock:
-                genai.configure(api_key=key)
-                model = genai.GenerativeModel(MODEL_NAME)
-            # เรียกจริงแบบเบาที่สุด เพื่อยืนยันว่า key ใช้ได้
-            response = await asyncio.to_thread(model.generate_content, "ping")
+            client_obj = get_client(key)
+            response = await asyncio.to_thread(
+                client_obj.models.generate_content,
+                model=MODEL_NAME,
+                contents="ping",
+            )
             _ = response.text
             status = "✅ ใช้งานได้"
-            if i in invalid_keys:
-                invalid_keys.discard(i)
+            invalid_keys.discard(i)
             if i in exhausted_keys:
                 status += " (แต่ก่อนหน้านี้โดน mark ว่า quota หมด ไม่ได้แก้อัตโนมัตินะ)"
         except Exception as e:
             err = str(e)
             if is_invalid_key_error(err):
-                status = f"❌ ใช้ไม่ได้ (invalid/permission): `{err[:150]}`"
+                status = f"❌ ใช้ไม่ได้ (invalid/permission/401): `{err[:150]}`"
+                invalid_keys.add(i)
+            elif "429" in err and is_zero_quota_unverified_error(err):
+                status = f"⚠️ limit:0 — บัญชียังไม่ผูก billing บน AI Studio: `{err[:150]}`"
                 invalid_keys.add(i)
             elif "429" in err and is_daily_quota_error(err):
                 status = f"⚠️ quota วันนี้หมด: `{err[:150]}`"
@@ -359,7 +386,7 @@ async def reset_daily_stats():
         chat_sessions.clear()
         exhausted_keys.clear()
         processing_users.clear()
-        # invalid_keys ไม่เคลียร์อัตโนมัติ เพราะเป็นปัญหาที่ key ผิดจริง ไม่ใช่ quota
+        # invalid_keys ไม่เคลียร์อัตโนมัติ เพราะเป็นปัญหา key ผิดจริง/บัญชียังไม่ verify ไม่ใช่ quota รายวัน
         print(f"[RESET] ✅ รีเซตแล้ว! ({stats['last_reset'].strftime('%d/%m/%Y %H:%M')} น.)", flush=True)
 
 
