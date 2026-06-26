@@ -5,7 +5,6 @@ import datetime
 import random
 import time
 import asyncio
-import itertools
 from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
@@ -29,7 +28,7 @@ ALLOWED_CHANNELS = [
 ]
 
 MODEL_NAME = "gemini-2.0-flash-lite"
-TZ_OFFSET = datetime.timezone(datetime.timedelta(hours=7))  # UTC+7
+TZ_OFFSET = datetime.timezone(datetime.timedelta(hours=7))
 
 SYSTEM_PROMPT = """
 คุณคือ SAI (ไซ) บอท AI ประจำเซิร์ฟเวอร์ Discord เพศหญิง
@@ -80,18 +79,15 @@ EMOJI_MAP = [
 # ============================
 
 def now_th():
-    """เวลาปัจจุบัน UTC+7"""
     return datetime.datetime.now(TZ_OFFSET)
 
 def make_model_with_key(key: str):
-    """สร้าง model โดยใช้ key ที่ระบุชัดๆ"""
     genai.configure(api_key=key)
     return genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
 
-# chat_sessions เก็บ (key_index, chat_object) เพื่อรู้ว่า session นี้ใช้ key ไหนอยู่
 chat_sessions = {}
-exhausted_keys = set()   # key ที่ daily quota หมดแล้ว จะ clear ตอน 07:00 น.
-processing_users = set() # กัน on_message trigger ซ้ำขณะกำลัง process อยู่
+exhausted_keys = set()   # key ที่ daily quota หมด → clear ทุก 07:00
+processing_users = set() # กัน reply ซ้ำขณะ process อยู่
 react_cooldown = {}
 REACT_COOLDOWN_SEC = 10
 
@@ -112,11 +108,9 @@ client = discord.Client(intents=intents)
 
 
 def get_or_create_chat(user_id: int, key_index: int):
-    """คืน chat session ที่ใช้ key_index นั้น ถ้าไม่มีหรือ key เปลี่ยนให้สร้างใหม่"""
     existing = chat_sessions.get(user_id)
     if existing and existing[0] == key_index:
         return existing[1]
-    # สร้าง session ใหม่ด้วย key ที่ถูกต้อง
     model = make_model_with_key(API_KEYS[key_index])
     chat = model.start_chat(history=[])
     chat_sessions[user_id] = (key_index, chat)
@@ -176,6 +170,7 @@ async def generate_image(prompt):
 async def process_message(message, user_input, image_data=None):
     # ป้องกัน on_message trigger ซ้ำขณะ process อยู่
     if message.author.id in processing_users:
+        print(f"[SKIP] user {message.author.id} กำลัง process อยู่ → skip")
         return
     processing_users.add(message.author.id)
     try:
@@ -192,12 +187,10 @@ async def process_message(message, user_input, image_data=None):
                     print(f"[INFO] ลองใช้ key {key_index + 1}/{len(API_KEYS)} ({key[:8]}...)")
 
                     if image_data:
-                        # image ไม่ต้องการ chat session
                         model = make_model_with_key(key)
                         parts = [user_input or "อธิบายรูปนี้ให้หน่อย", image_data]
                         response = model.generate_content(parts)
                     else:
-                        # ดึง/สร้าง chat session ที่ผูกกับ key นี้ชัดๆ
                         chat = get_or_create_chat(message.author.id, key_index)
                         response = chat.send_message(user_input)
 
@@ -215,21 +208,18 @@ async def process_message(message, user_input, image_data=None):
 
                     if "429" in err_msg:
                         if "per_day" in err_msg.lower() or "PerDay" in err_msg or "GenerateRequestsPerDay" in err_msg:
-                            # daily quota หมด → blacklist key นี้จนถึง 07:00 น.
                             exhausted_keys.add(key_index)
                             remaining = len(API_KEYS) - len(exhausted_keys)
                             print(f"[WARN] key {key_index + 1} daily quota หมด → blacklist (เหลือ {remaining} key(s))")
                             continue  # ลอง key ถัดไป
                         else:
-                            # per_minute หรือ quota อื่น → รอแล้วลอง key เดิมซ้ำ
-                            print(f"[WARN] key {key_index + 1} rate limit hit → รอ 3s แล้วลองใหม่")
+                            print(f"[WARN] key {key_index + 1} rate limit → รอ 3s")
                             await asyncio.sleep(3)
                             continue
 
                     # error อื่น → หยุดเลย
                     break
 
-            # reply error แค่ครั้งเดียว
             if last_error:
                 await message.reply(parse_error(last_error))
     finally:
@@ -240,7 +230,6 @@ async def process_message(message, user_input, image_data=None):
 # AUTO RESET DAILY STATS
 # =======================
 async def reset_daily_stats():
-    """รีเซต stats ทุกวันตอน 07:00 น. UTC+7"""
     await client.wait_until_ready()
     while not client.is_closed():
         now = now_th()
@@ -249,7 +238,7 @@ async def reset_daily_stats():
             next_reset += datetime.timedelta(days=1)
 
         wait_seconds = (next_reset - now).total_seconds()
-        print(f"[RESET] จะรีเซต stats ในอีก {wait_seconds/3600:.1f} ชั่วโมง (ตอน {next_reset.strftime('%d/%m/%Y %H:%M')} น. UTC+7)")
+        print(f"[RESET] จะรีเซตในอีก {wait_seconds/3600:.1f}h (ตอน {next_reset.strftime('%d/%m/%Y %H:%M')} น.)")
         await asyncio.sleep(wait_seconds)
 
         stats["total_requests"] = 0
@@ -258,9 +247,10 @@ async def reset_daily_stats():
         stats["total_reactions"] = 0
         stats["total_images"] = 0
         stats["last_reset"] = now_th()
-        chat_sessions.clear()   # clear sessions เพื่อให้ key_index reset
-        exhausted_keys.clear()  # unblacklist ทุก key พร้อมกัน
-        print(f"[RESET] ✅ รีเซต daily stats แล้ว! ({stats['last_reset'].strftime('%d/%m/%Y %H:%M')} น.)")
+        chat_sessions.clear()
+        exhausted_keys.clear()
+        processing_users.clear()
+        print(f"[RESET] ✅ รีเซตแล้ว! ({stats['last_reset'].strftime('%d/%m/%Y %H:%M')} น.)")
 
 
 # =======================
