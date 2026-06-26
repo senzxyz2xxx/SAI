@@ -4,6 +4,8 @@ import os
 import datetime
 import random
 import time
+import asyncio
+import itertools
 from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
@@ -11,9 +13,17 @@ from threading import Thread
 load_dotenv()
 
 # ========== CONFIG ==========
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = 1005357318281641994
+
+# ใส่ key เพิ่มได้เรื่อยๆ กัน quota หมด
+API_KEYS = [k for k in [
+    os.getenv("GEMINI_API_KEY"),
+    os.getenv("GEMINI_API_KEY_2"),
+    os.getenv("GEMINI_API_KEY_3"),
+] if k]
+
+key_cycle = itertools.cycle(API_KEYS)
 
 ALLOWED_CHANNELS = [
     1518970044925739160,
@@ -29,7 +39,7 @@ SYSTEM_PROMPT = """
 
 ─── สไตล์การคุย ───
 - ตอบให้พอดีกับคำถาม — ถามสั้นตอบสั้น ถามยาวค่อยตอบยาว
-- <@1005357318281641994> คือท่านเซน ผู้สร้างของไซ ถ้าจะแท็กให้ใช้ <@1005357318281641994>
+- <1005357318281641994> คือปะป๋า ผู้สร้างของไซ ถ้าจะแท็กให้ใช้ <@1005357318281641994>
 - คุยเป็นธรรมชาติ เหมือนเพื่อนสนิท ตอบกระชับ ไม่เยิ่นเย้อ
 - ใช้คำลงท้าย "อ่ะ", "นะ", "เนอะ", "ว่ะ" ตามบริบท
 - ใส่อารมณ์ได้ เช่น "อุ๊ย!", "อ่าaaaา", "ฮ่าๆ"
@@ -51,10 +61,30 @@ SYSTEM_PROMPT = """
 - ไม่ช่วยสร้างมัลแวร์หรือหลอกลวง
 - ไม่สร้างเนื้อหาทางเพศอย่างโจ่งแจ้ง
 """
+
+EMOJI_MAP = [
+    (["ฮ่า", "555", "ขำ", "ตลก", "lol", "lmao", "haha", "ฮาา"], ["😂", "💀", "🤣"]),
+    (["เศร้า", "หม่น", "ร้องไห้", "sad", "ซึ้ง", "เสียใจ"], ["🥺", "😢", "💔"]),
+    (["โกรธ", "หัวร้อน", "wtf", "เหี้ย", "บ้า", "ห่า"], ["💢", "😤", "🤬"]),
+    (["น่ารัก", "cute", "อ่อน", "หวาน", "ปิ๊ง"], ["🥰", "😍", "💕"]),
+    (["เกม", "game", "ranked", "ดรอป", "ff", "gg", "ez"], ["🎮", "👾", "🕹️"]),
+    (["อาหาร", "กิน", "หิว", "อร่อย", "ข้าว", "ชา", "กาแฟ", "ชานม"], ["😋", "🍜", "🤤"]),
+    (["นอน", "ง่วง", "zzz", "หลับ", "ตื่น"], ["😴", "💤"]),
+    (["เหนื่อย", "ท้อ", "ไม่ไหว", "พัง", "หมดแรง"], ["😮‍💨", "💀", "🫠"]),
+    (["เย้", "ยินดี", "ดีใจ", "congrats", "ฉลอง", "ผ่าน"], ["🎉", "🥳", "🎊"]),
+    (["ทำไม", "อะไร", "ยังไง", "เหรอ", "จริงหรอ", "แน่ใจ"], ["🤔", "👀", "❓"]),
+    (["ดี", "เก่ง", "เยี่ยม", "โคตร", "ปัง", "สุด", "เทพ"], ["🔥", "👏", "✨"]),
+    (["อนิเมะ", "มังงะ", "ซีรี่ส์", "ดูอะไร"], ["👀", "🍿", "✨"]),
+    (["รัก", "ชอบ", "แฟน", "กอด", "คิดถึง"], ["💖", "🥰", "💌"]),
+    (["เงิน", "ตัง", "แพง", "จน", "broke"], ["💸", "😭", "🪙"]),
+    (["เพลง", "ฟัง", "spotify", "cover"], ["🎵", "🎶", "🎧"]),
+]
 # ============================
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
+def make_model():
+    key = next(key_cycle)
+    genai.configure(api_key=key)
+    return genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
 
 chat_sessions = {}
 react_cooldown = {}
@@ -69,25 +99,6 @@ stats = {
     "start_time": datetime.datetime.now(),
 }
 
-# keyword → emoji pool
-EMOJI_MAP = [
-    (["ฮ่า", "555", "ขำ", "ตลก", "lol", "lmao", "haha", "ฮาา"], ["😂", "💀", "🤣"]),
-    (["เศร้า", "หม่น", "ร้องไห้", "sad", "ซึ้ง", "เสียใจ"], ["🥺", "😢", "💔"]),
-    (["โกรธ", "หัวร้อน", "หัวร้อน", "wtf", "เหี้ย", "บ้า", "ห่า"], ["💢", "😤", "🤬"]),
-    (["น่ารัก", "cute", "อ่อน", "หวาน", "ปิ๊ง"], ["🥰", "😍", "💕"]),
-    (["เกม", "game", "ranked", "ดรอป", "ff", "gg", "ez"], ["🎮", "👾", "🕹️"]),
-    (["อาหาร", "กิน", "หิว", "อร่อย", "ข้าว", "ชา", "กาแฟ", "ชานม"], ["😋", "🍜", "🤤"]),
-    (["นอน", "ง่วง", "zzz", "หลับ", "ตื่น"], ["😴", "💤"]),
-    (["เหนื่อย", "ท้อ", "ไม่ไหว", "พัง", "หมดแรง"], ["😮‍💨", "💀", "🫠"]),
-    (["เย้", "ยินดี", "ดีใจ", "congrats", "ปาร์ตี้", "ฉลอง", "ผ่าน"], ["🎉", "🥳", "🎊"]),
-    (["?", "ทำไม", "อะไร", "ยังไง", "เหรอ", "จริงหรอ", "แน่ใจ"], ["🤔", "👀", "❓"]),
-    (["ดี", "เก่ง", "เยี่ยม", "โคตร", "ปัง", "สุด", "เทพ"], ["🔥", "👏", "✨"]),
-    (["อนิเมะ", "มังงะ", "วาย", "ซีรี่ส์", "ดูอะไร"], ["👀", "🍿", "✨"]),
-    (["รัก", "ชอบ", "แฟน", "กอด", "คิดถึง"], ["💖", "🥰", "💌"]),
-    (["เงิน", "ตัง", "แพง", "จน", "broke"], ["💸", "😭", "🪙"]),
-    (["ดนตรี", "เพลง", "ฟัง", "spotify", "cover"], ["🎵", "🎶", "🎧"]),
-]
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -96,39 +107,53 @@ client = discord.Client(intents=intents)
 
 def get_chat(user_id):
     if user_id not in chat_sessions:
-        chat_sessions[user_id] = model.start_chat(history=[])
+        chat_sessions[user_id] = make_model().start_chat(history=[])
     return chat_sessions[user_id]
 
 
 def count_tokens(text):
     try:
-        return model.count_tokens(text).total_tokens
-    except:
         return len(text) // 4
+    except:
+        return 0
+
+
+def parse_error(e: Exception) -> str:
+    """แปลง error เป็นข้อความภาษาคนอ่านได้"""
+    msg = str(e)
+    if "429" in msg:
+        if "per_day" in msg.lower() or "PerDay" in msg or "GenerateRequestsPerDay" in msg:
+            return "❌ quota วันนี้หมดแล้วอ่ะ รอรีเซตตอน 07:00 น. (UTC+7) นะ 🙏"
+        if "per_minute" in msg.lower() or "PerMinute" in msg or "GenerateRequestsPerMinute" in msg:
+            return "⏳ request เยอะเกินต่อนาทีอ่ะ รอแป๊บนึงแล้วลองใหม่นะ"
+        if "token" in msg.lower():
+            return "⏳ ส่ง token เยอะเกินไปอ่ะ ลองพิมพ์สั้นลงหน่อยได้มั้ย"
+        return "❌ quota หมดอ่ะ รอแป๊บนึงแล้วลองใหม่นะ 🙏"
+    if "400" in msg:
+        return "❌ ข้อความนี้บอทรับไม่ได้อ่ะ ลองใหม่ด้วยข้อความอื่นนะ"
+    if "403" in msg:
+        return "❌ API key ไม่มีสิทธิ์ใช้งาน ลองติดต่อท่านเซนนะ"
+    if "500" in msg or "503" in msg:
+        return "❌ server Gemini มีปัญหาอ่ะ รอแป๊บแล้วลองใหม่นะ"
+    if "invalid" in msg.lower() and "key" in msg.lower():
+        return "❌ API key ไม่ถูกต้องอ่ะ ลองติดต่อท่านเซนนะ"
+    return f"❌ เกิด error อ่ะ: `{msg[:200]}`"
 
 
 async def auto_react(message):
-    """React emoji ตาม keyword ไม่ใช้ AI — ประหยัด quota"""
+    """React emoji ตาม keyword — ไม่กิน quota"""
     try:
         if len(message.content.strip()) < 2:
             return
-
         now = time.time()
         if now - react_cooldown.get(message.author.id, 0) < REACT_COOLDOWN_SEC:
             return
-
         text = message.content.lower()
-        matched = []
-
-        for keywords, emojis in EMOJI_MAP:
-            if any(kw in text for kw in keywords):
-                matched.append(random.choice(emojis))
-
+        matched = [random.choice(emojis) for kws, emojis in EMOJI_MAP if any(kw in text for kw in kws)]
         if matched:
             await message.add_reaction(matched[0])
             react_cooldown[message.author.id] = now
             stats["total_reactions"] += 1
-
     except Exception as e:
         print(f"[REACT ERROR] {e}")
 
@@ -140,28 +165,35 @@ async def generate_image(prompt):
 
 async def process_message(message, user_input, image_data=None):
     async with message.channel.typing():
-        try:
-            chat = get_chat(message.author.id)
-
-            if image_data:
-                parts = [user_input or "อธิบายรูปนี้ให้หน่อย", image_data]
-                response = model.generate_content(parts)
-            else:
-                response = chat.send_message(user_input)
-
-            reply = response.text
-
+        for attempt in range(len(API_KEYS) or 1):
             try:
+                chat = get_chat(message.author.id)
+
+                if image_data:
+                    parts = [user_input or "อธิบายรูปนี้ให้หน่อย", image_data]
+                    response = make_model().generate_content(parts)
+                else:
+                    response = chat.send_message(user_input)
+
+                reply = response.text
                 stats["total_requests"] += 1
                 stats["total_tokens_in"] += count_tokens(user_input or "")
                 stats["total_tokens_out"] += count_tokens(reply)
-            except:
-                pass
 
-            await message.reply(reply[:1950] + "..." if len(reply) > 2000 else reply)
+                await message.reply(reply[:1950] + "..." if len(reply) > 2000 else reply)
+                return
 
-        except Exception as e:
-            await message.reply(f"❌ `{str(e)}`")
+            except Exception as e:
+                err_msg = str(e)
+                # ถ้า 429 per-minute → รอ 60 วิแล้วลอง key ถัดไป
+                if "429" in err_msg and attempt < len(API_KEYS) - 1:
+                    print(f"[WARN] key {attempt+1} quota hit, switching key...")
+                    chat_sessions.pop(message.author.id, None)  # reset session ให้ใช้ key ใหม่
+                    await asyncio.sleep(2)
+                    continue
+                # error อื่น หรือ key หมดทุกอัน
+                await message.reply(parse_error(e))
+                return
 
 
 # =======================
@@ -238,7 +270,7 @@ def home():
     <div class="model-card">
         <div class="model-icon">✨</div>
         <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + Auto React + Image Gen</div></div>
-        <div class="model-badge">Free Tier</div>
+        <div class="model-badge">Free Tier · {len(API_KEYS)} key(s)</div>
     </div>
     <div class="grid">
         <div class="card">
@@ -287,11 +319,12 @@ def home():
         </div>
     </div>
     <div class="limits-card">
-        <div class="limits-title">⚡ Free Tier Rate Limits</div>
+        <div class="limits-title">⚡ Free Tier Rate Limits (ต่อ key)</div>
         <div class="limit-row"><span class="limit-label">Requests / นาที</span><span class="limit-val">15 RPM</span></div>
         <div class="limit-row"><span class="limit-label">Requests / วัน</span><span class="limit-val">1,500 RPD</span></div>
         <div class="limit-row"><span class="limit-label">Tokens / นาที</span><span class="limit-val">250,000 TPM</span></div>
         <div class="limit-row"><span class="limit-label">Tokens / วัน</span><span class="limit-val">1,000,000 TPD</span></div>
+        <div class="limit-row"><span class="limit-label">API Keys ที่ใช้</span><span class="limit-val">{len(API_KEYS)} key(s)</span></div>
         <div class="limit-row"><span class="limit-label">Active Sessions</span><span class="limit-val">{len(chat_sessions)} users</span></div>
     </div>
     <div class="footer">หน้านี้รีเฟรชอัตโนมัติทุก 30 วินาที • สถิติรีเซตเมื่อ restart บอท</div>
@@ -312,7 +345,7 @@ def keep_alive():
 
 @client.event
 async def on_ready():
-    print(f"✅ บอทออนไลน์แล้ว: {client.user}")
+    print(f"✅ บอทออนไลน์แล้ว: {client.user} ({len(API_KEYS)} API key(s) โหลดแล้ว)")
 
 
 @client.event
@@ -346,7 +379,8 @@ async def on_message(message):
                 f"• Tokens: `{total_tokens:,}` / 1,000,000\n"
                 f"• Reactions: `{stats['total_reactions']}`\n"
                 f"• Images: `{stats['total_images']}`\n"
-                f"• Sessions: `{len(chat_sessions)}` users"
+                f"• Sessions: `{len(chat_sessions)}` users\n"
+                f"• API Keys: `{len(API_KEYS)}` key(s)"
             )
             return
 
