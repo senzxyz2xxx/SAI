@@ -168,6 +168,8 @@ async def generate_image(prompt):
 
 async def process_message(message, user_input, image_data=None):
     async with message.channel.typing():
+        last_error = None
+
         for attempt in range(len(API_KEYS) or 1):
             try:
                 chat = get_chat(message.author.id)
@@ -184,17 +186,25 @@ async def process_message(message, user_input, image_data=None):
                 stats["total_tokens_out"] += count_tokens(reply)
 
                 await message.reply(reply[:1950] + "..." if len(reply) > 2000 else reply)
-                return
+                return  # สำเร็จ → ออกเลย
 
             except Exception as e:
                 err_msg = str(e)
+                last_error = e
+
+                # 429 และยังมี key เหลือ → switch key แล้วลองใหม่
                 if "429" in err_msg and attempt < len(API_KEYS) - 1:
                     print(f"[WARN] key {attempt+1} quota hit, switching key...")
                     chat_sessions.pop(message.author.id, None)
                     await asyncio.sleep(2)
                     continue
-                await message.reply(parse_error(e))
-                return
+
+                # error อื่น หรือ key หมดทุกอัน → หยุดเลย
+                break
+
+        # reply error แค่ครั้งเดียวหลัง loop จบ
+        if last_error:
+            await message.reply(parse_error(last_error))
 
 
 # =======================
@@ -205,7 +215,6 @@ async def reset_daily_stats():
     await client.wait_until_ready()
     while not client.is_closed():
         now = now_th()
-        # คำนวณเวลา 07:00 น. วันถัดไป (UTC+7)
         next_reset = now.replace(hour=7, minute=0, second=0, microsecond=0)
         if now >= next_reset:
             next_reset += datetime.timedelta(days=1)
@@ -214,7 +223,6 @@ async def reset_daily_stats():
         print(f"[RESET] จะรีเซต stats ในอีก {wait_seconds/3600:.1f} ชั่วโมง (ตอน {next_reset.strftime('%d/%m/%Y %H:%M')} น. UTC+7)")
         await asyncio.sleep(wait_seconds)
 
-        # รีเซต
         stats["total_requests"] = 0
         stats["total_tokens_in"] = 0
         stats["total_tokens_out"] = 0
@@ -238,7 +246,6 @@ def home():
     current_th = now_th().strftime("%d/%m/%Y %H:%M:%S")
     last_reset_th = stats["last_reset"].strftime("%d/%m/%Y %H:%M")
 
-    # คำนวณเวลารีเซตครั้งถัดไป
     _now = now_th()
     next_reset = _now.replace(hour=7, minute=0, second=0, microsecond=0)
     if _now >= next_reset:
