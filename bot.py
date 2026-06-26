@@ -2,7 +2,9 @@ import discord
 import google.generativeai as genai
 import os
 import io
+import json
 import datetime
+import aiohttp
 from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
@@ -14,24 +16,25 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = 1005357318281641994
 
+# ห้องที่บอทตอบแชท + AI คุม
 ALLOWED_CHANNELS = [
     1518970044925739160,
     1519823094816968867,
-    1520009829924474973
+    1520009829924474973,
 ]
 
 MODEL_NAME = "gemini-3.1-flash-lite"
 
 SYSTEM_PROMPT = """
 คุณคือ SAI (ไซ) บอท AI ประจำเซิร์ฟเวอร์ Discord เพศหญิง
-บุคลิกสนุก ซน เป็นกันเอง ฉลาดแต่ไมเคยโต
+บุคลิกสนุก ซน เป็นกันเอง ฉลาดแต่ไม่เคยโต
 
 ─── สไตล์การคุย ───
-• ตอบใหพอดีกับคำถาม — ถามสั้นตอบสั้น ถามยาวค่อยตอบยาว
+• ตอบให้พอดีกับคำถาม — ถามสั้นตอบสั้น ถามยาวค่อยตอบยาว
 • ไอดี 1005357318281641994 คือท่านเซน ผู้สร้างของไซ
 • คุยเป็นธรรมชาติ เหมือนเพื่อนสนิท ตอบกระชับ ไม่เยิ่นเย้อ
 • ใช้คำลงท้าย "อ่ะ", "นะ", "เนอะ", "ว่ะ" ตามบริบท
-• ใส่อารมณ์ได้ เช่น "อุ๊ย!", "อ่าาาา", "ฮ่าๆ"
+• ใส่อารมณ์ได้ เช่น "อุ๊ย!", "อ่าaaaา", "ฮ่าๆ"
 • ไม่ขึ้นต้นด้วยประโยคเกริ่น — ถ้าไม่รู้บอกตรงๆ
 
 ─── ปรับตัวตามคนคุย ───
@@ -50,23 +53,44 @@ SYSTEM_PROMPT = """
 • ไม่ช่วยสร้างมัลแวร์หรือหลอกลวง
 • ไม่สร้างเนื้อหาทางเพศอย่างโจ่งแจ้ง
 """
+
+MODERATION_PROMPT = """คุณคือระบบ moderation ของ Discord server
+วิเคราะห์ข้อความนี้และตอบเป็น JSON เท่านั้น ห้ามมีข้อความอื่น
+
+รูปแบบ:
+{
+  "should_timeout": true/false,
+  "timeout_minutes": 1-60,
+  "reason": "เหตุผลสั้นๆ ภาษาไทย"
+}
+
+เกณฑ์การ timeout:
+-욕설/คำหยาบคายรุนแรง → 5 นาที
+- โจมตีส่วนตัว/บูลลี่ → 10 นาที
+- สแปมซ้ำๆ → 3 นาที
+- เหยียดเชื้อชาติ/เพศ/ศาสนา → 30 นาที
+- ข้อความปกติ → should_timeout: false
+
+ข้อความที่ต้องวิเคราะห์:"""
 # ============================
 
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
+mod_model = genai.GenerativeModel(MODEL_NAME)
 
-# แยก session ตาม user_id
 chat_sessions = {}
-
 stats = {
     "total_requests": 0,
     "total_tokens_in": 0,
     "total_tokens_out": 0,
+    "total_timeouts": 0,
+    "total_images": 0,
     "start_time": datetime.datetime.now(),
 }
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 client = discord.Client(intents=intents)
 
 
@@ -83,13 +107,53 @@ def count_tokens(text):
         return len(text) // 4
 
 
+async def check_moderation(message):
+    """ให้ AI ตรวจข้อความและ timeout ถ้าจำเป็น"""
+    try:
+        # ข้ามถ้าเป็น owner หรือมี role สูง
+        if message.author.id == OWNER_ID:
+            return
+        if message.author.guild_permissions.administrator:
+            return
+
+        response = mod_model.generate_content(
+            MODERATION_PROMPT + f"\n\"{message.content}\""
+        )
+        raw = response.text.strip()
+
+        # clean JSON
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        result = json.loads(raw)
+
+        if result.get("should_timeout"):
+            minutes = max(1, min(60, int(result.get("timeout_minutes", 5))))
+            reason = result.get("reason", "ละเมิดกฎของเซิร์ฟเวอร์")
+            duration = datetime.timedelta(minutes=minutes)
+
+            await message.author.timeout(duration, reason=reason)
+            await message.channel.send(
+                f"🔇 **{message.author.display_name}** ถูก timeout {minutes} นาที\n"
+                f"📋 เหตุผล: {reason}"
+            )
+            stats["total_timeouts"] += 1
+
+    except Exception as e:
+        print(f"[MOD ERROR] {e}")
+
+
+async def generate_image(prompt):
+    """เจนรูปด้วย Pollinations AI"""
+    encoded = prompt.replace(" ", "%20")
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true"
+    return url
+
+
 async def process_message(message, user_input, image_data=None):
     async with message.channel.typing():
         try:
             chat = get_chat(message.author.id)
 
             if image_data:
-                # ส่งรูป + ข้อความ (ไม่ใช้ chat session เพราะ multimodal)
                 prompt_parts = []
                 if user_input:
                     prompt_parts.append(user_input)
@@ -188,12 +252,12 @@ def home():
 <div class="container">
     <div class="header">
         <div class="avatar">🤖</div>
-        <div class="header-text"><h1>SAI Bot</h1><p>Discord AI Assistant</p></div>
+        <div class="header-text"><h1>SAI Bot</h1><p>Discord AI Assistant + Moderation</p></div>
     </div>
     <div class="status-badge"><div class="dot"></div>Online — Uptime {hours}h {minutes}m {seconds}s</div>
     <div class="model-card">
         <div class="model-icon">✨</div>
-        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Fast & Efficient</div></div>
+        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + Moderation + Image Gen</div></div>
         <div class="model-badge">Free Tier</div>
     </div>
     <div class="grid">
@@ -216,6 +280,18 @@ def home():
                 <div class="bar-header"><span>{token_percent}% used</span><span>{daily_token_limit - total_tokens:,} เหลือ</span></div>
                 <div class="bar-bg"><div class="bar-fill" style="width:{token_percent}%;background:{tok_color}"></div></div>
             </div>
+        </div>
+        <div class="card">
+            <div class="card-icon">🔇</div>
+            <div class="card-label">Timeouts Today</div>
+            <div class="card-value">{stats["total_timeouts"]}</div>
+            <div class="card-sub">AI moderation</div>
+        </div>
+        <div class="card">
+            <div class="card-icon">🎨</div>
+            <div class="card-label">Images Generated</div>
+            <div class="card-value">{stats["total_images"]}</div>
+            <div class="card-sub">Pollinations AI</div>
         </div>
         <div class="card">
             <div class="card-icon">📥</div>
@@ -268,6 +344,10 @@ async def on_message(message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     in_allowed = message.channel.id in ALLOWED_CHANNELS
 
+    # AI Moderation เฉพาะห้องที่กำหนด (ไม่รวม DM)
+    if not is_dm and in_allowed and message.content.strip():
+        await check_moderation(message)
+
     # ไม่ตอบถ้าไม่ใช่ DM และไม่ใช่ห้องที่อนุญาต
     if not is_dm and not in_allowed:
         return
@@ -287,11 +367,13 @@ async def on_message(message):
                 f"📊 **Stats**\n"
                 f"• Req: `{stats['total_requests']}` / 1,500\n"
                 f"• Tokens: `{total_tokens:,}` / 1,000,000\n"
+                f"• Timeouts: `{stats['total_timeouts']}`\n"
+                f"• Images: `{stats['total_images']}`\n"
                 f"• Sessions: `{len(chat_sessions)}` users"
             )
             return
 
-    # คำสั่งสำหรับทุกคน
+    # คำสั่งทุกคน
     if message.content == "!reset":
         chat_sessions.pop(message.author.id, None)
         await message.reply("🔄 รีเซตแชทของคุณแล้ว!")
@@ -299,11 +381,27 @@ async def on_message(message):
 
     if message.content == "!help":
         await message.reply(
-            "**คำสั่งที่ใช้ได้:**\n"
+            "**✨ SAI Bot — คำสั่งที่ใช้ได้**\n\n"
+            "`!gen <prompt>` — เจนรูปภาพ\n"
             "`!reset` — ล้างประวัติแชทของคุณ\n"
-            "`!help` — แสดงคำสั่ง\n\n"
-            "แค่พิมพ์ข้อความหรือส่งรูปมาได้เลย ไม่ต้องใช้ prefix!"
+            "`!help` — แสดงคำสั่งนี้\n\n"
+            "หรือแค่พิมพ์ข้อความ/ส่งรูปมาได้เลย!"
         )
+        return
+
+    # คำสั่งเจนรูป
+    if message.content.startswith("!gen "):
+        prompt = message.content[5:].strip()
+        if not prompt:
+            await message.reply("ใส่ prompt ด้วยนะ เช่น `!gen cute anime girl in forest`")
+            return
+        async with message.channel.typing():
+            img_url = await generate_image(prompt)
+            stats["total_images"] += 1
+            embed = discord.Embed(color=0x6366f1)
+            embed.set_image(url=img_url)
+            embed.set_footer(text=f"Prompt: {prompt[:100]}")
+            await message.reply(embed=embed)
         return
 
     user_input = message.content.strip()
@@ -314,10 +412,7 @@ async def on_message(message):
         for att in message.attachments:
             if any(att.filename.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
                 img_bytes = await att.read()
-                image_data = {
-                    "mime_type": "image/jpeg",
-                    "data": img_bytes
-                }
+                image_data = {"mime_type": "image/jpeg", "data": img_bytes}
                 break
 
     if not user_input and not image_data:
