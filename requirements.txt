@@ -1,4 +1,4 @@
 discord.py
-groq
+google-genai
 flask
 python-dotenv
