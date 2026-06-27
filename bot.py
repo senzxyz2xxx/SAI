@@ -44,7 +44,7 @@ SYSTEM_PROMPT = """
 ─── สไตล์การคุย ───
 - พูดเหมือนเด็กผู้หญิงน่ารักๆ ใช้ "ค่ะ" "นะคะ" "อ่ะค่ะ" ได้ตามธรรมชาติ
 - พูดเยอะได้ ชอบเล่าเรื่อง ชอบแสดงความรู้สึก ชอบแซว
-- ใส่อารมณ์เต็มที่ เช่น "อุ๊ย!", "ว้าวว!", "ฮ่าๆๆ", "เอ๊ะ?", "อ่าาาา", "ป๊าก!"
+- ใส่อารมณ์เต็มที่ เช่น "อุ๊ย!", "ว้าวว!", "ฮ่าๆๆ", "เอ๊ะ?", "อ่าaaaา", "ป๊าก!"
 - คุยธรรมชาติเหมือนเพื่อนสนิท ไม่ formal ไม่เป็นทางการ
 - ถ้าทักมาแค่ "ว่าไง" หรือ "สวัสดี" ให้ตอบทักกลับสั้นๆ สนุกๆ ก่อน ไม่ต้องถามว่า "มีอะไรให้ช่วยมั้ย" ทุกครั้ง
 
@@ -80,7 +80,11 @@ user_histories = {}
 exhausted_keys = set()
 invalid_keys = set()
 processing_users = set()
-processed_messages = set()   # กันตอบซ้ำ message เดิม
+
+# --- dedup: map message_id → timestamp ---
+processed_messages: dict[int, float] = {}
+DEDUP_TTL = 30  # วินาที — ล้าง cache หลังจากนี้
+
 react_cooldown = {}
 REACT_COOLDOWN_SEC = 10
 
@@ -515,6 +519,13 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    # ===== กัน message เก่า (reconnect replay) =====
+    age = (datetime.datetime.now(datetime.timezone.utc) - message.created_at).total_seconds()
+    if age > 10:
+        print(f"[SKIP] message เก่า {age:.1f}s → skip", flush=True)
+        return
+    # ================================================
+
     is_dm = isinstance(message.channel, discord.DMChannel)
     in_allowed = message.channel.id in ALLOWED_CHANNELS
 
@@ -524,14 +535,18 @@ async def on_message(message):
     if not is_dm and not in_allowed:
         return
 
-    # ===== กันตอบซ้ำ message เดิม (แก้บัคตอบ 2 อัน) =====
+    # ===== กันตอบซ้ำ message เดิม (dedup ด้วย timestamp) =====
+    now_ts = time.time()
+    # ล้าง cache entry เก่าที่หมด TTL แล้ว
+    expired = [k for k, v in processed_messages.items() if now_ts - v > DEDUP_TTL]
+    for k in expired:
+        del processed_messages[k]
+
     if message.id in processed_messages:
-        print(f"[SKIP] message {message.id} ถูก process แล้ว → skip", flush=True)
+        print(f"[SKIP] message {message.id} ซ้ำ → skip", flush=True)
         return
-    processed_messages.add(message.id)
-    if len(processed_messages) > 1000:
-        processed_messages.clear()
-    # =====================================================
+    processed_messages[message.id] = now_ts
+    # ==========================================================
 
     if message.author.id == OWNER_ID:
         if message.content == "!reset":
