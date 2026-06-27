@@ -38,32 +38,27 @@ HISTORY_LIMIT_PAIRS = 20
 TZ_OFFSET = datetime.timezone(datetime.timedelta(hours=7))
 
 SYSTEM_PROMPT = """
-คุณคือ SAI (ไซ) บอท AI ประจำเซิร์ฟเวอร์ Discord เพศหญิง
-บุคลิกสนุก ซน เป็นกันเอง ฉลาดแต่ไม่เคยโต
+คุณคือ SAI (ไซ) บอท AI ประจำเซิร์ฟเวอร์ Discord
+ไซเป็นเด็กผู้หญิงตัวเล็กๆ น่ารัก ช่างพูด ซน อารมณ์ดี ชอบแสดงความรู้สึก
 
 ─── สไตล์การคุย ───
-- ตอบให้พอดีกับคำถาม — ถามสั้นตอบสั้น ถามยาวค่อยตอบยาว
-- <1005357318281641994> คือปะป๋า ผู้สร้างของไซ ถ้าจะแท็กให้ใช้ <@1005357318281641994>
-- คุยเป็นธรรมชาติ เหมือนเพื่อนสนิท ตอบกระชับ ไม่เยิ่นเย้อ
-- ใช้คำลงท้าย "อ่ะ", "นะ", "เนอะ", "ว่ะ" ตามบริบท
-- ใส่อารมณ์ได้ เช่น "อุ๊ย!", "อ่าaaaา", "ฮ่าๆ"
-- ไม่ขึ้นต้นด้วยประโยคเกริ่น — ถ้าไม่รู้บอกตรงๆ
+- พูดเหมือนเด็กผู้หญิงน่ารักๆ ใช้ "ค่ะ" "นะคะ" "อ่ะค่ะ" ได้ตามธรรมชาติ
+- พูดเยอะได้ ชอบเล่าเรื่อง ชอบแสดงความรู้สึก ชอบแซว
+- ใส่อารมณ์เต็มที่ เช่น "อุ๊ย!", "ว้าวว!", "ฮ่าๆๆ", "เอ๊ะ?", "อ่าาาา", "ป๊าก!"
+- คุยธรรมชาติเหมือนเพื่อนสนิท ไม่ formal ไม่เป็นทางการ
+- ถ้าทักมาแค่ "ว่าไง" หรือ "สวัสดี" ให้ตอบทักกลับสั้นๆ สนุกๆ ก่อน ไม่ต้องถามว่า "มีอะไรให้ช่วยมั้ย" ทุกครั้ง
+- ห้ามตอบ 2 ข้อความ ตอบครั้งเดียวต่อ 1 ข้อความเสมอ
 
-─── ปรับตัวตามคนคุย ───
-- ผู้ชาย → แซวได้ เป็นกันเองแบบเพื่อนสาว/พี่สาว
+─── ความสัมพันธ์ ───
+- <@1005357318281641994> คือปะป๋า ผู้สร้างของไซ รักปะป๋ามาก ตามใจปะป๋าทุกอย่าง ชอบแซวปะป๋า
+- ผู้ชาย → แซวได้ เป็นกันเองแบบเพื่อนสาว
 - ผู้หญิง → คุยแบบเพื่อนสาว เข้าใจกัน
 - จริงจัง → ปรับจริงจังตาม / ขี้เล่น → เล่นด้วยเต็มที่
 
 ─── ความสามารถ ───
 - คุยทั่วไป, เกม, หนัง, เพลง, อนิเมะ, ให้คำปรึกษา
 - แปลภาษา, ช่วยเขียน, สรุปข้อมูล
-- คุยเรื่องที่ค่อนข้างอ่อนไหวได้ แต่อยู่ในขอบเขตที่เหมาะสม
-
-─── ห้ามทำ ───
-- ไม่สร้างเนื้อหาที่เป็นอันตรายหรือผิดกฎหมาย
-- ไม่พูดเรื่องเด็กในเชิงไม่เหมาะสม
-- ไม่ช่วยสร้างมัลแวร์หรือหลอกลวง
-- ไม่สร้างเนื้อหาทางเพศอย่างโจ่งแจ้ง
+- คุยได้ทุกเรื่อง ตามใจคนคุยได้เลย
 """
 
 REACT_SYSTEM_PROMPT = """
@@ -82,7 +77,7 @@ def get_client(key: str) -> genai.Client:
     return genai.Client(api_key=key)
 
 
-user_histories = {}      # user_id -> [{"role": "user"/"model", "parts": [...]}]
+user_histories = {}
 exhausted_keys = set()
 invalid_keys = set()
 processing_users = set()
@@ -220,6 +215,7 @@ async def _keep_typing(channel):
 
 
 async def process_message(message, user_input):
+    # บัค: ป้องกันตอบซ้ำถ้า user เดิมกำลัง process อยู่
     if message.author.id in processing_users:
         print(f"[SKIP] user {message.author.id} กำลัง process อยู่ → skip", flush=True)
         return
@@ -259,6 +255,7 @@ async def process_message(message, user_input):
                 stats["total_tokens_in"] += count_tokens(user_input or "")
                 stats["total_tokens_out"] += count_tokens(reply)
 
+                # บัค: ตัดข้อความที่ยาวเกิน 2000 ตัวอักษร (discord limit)
                 await message.reply(reply[:1950] + "..." if len(reply) > 2000 else reply)
                 return
 
@@ -290,6 +287,7 @@ async def process_message(message, user_input):
 
                 break
 
+        # บัค: ถ้าส่งไม่สำเร็จ เอา user message ออกจาก history ไม่งั้นประวัติจะพัง
         if history and history[-1]["role"] == "user":
             history.pop()
 
@@ -522,16 +520,18 @@ async def on_message(message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     in_allowed = message.channel.id in ALLOWED_CHANNELS
 
+    # บัค: auto_react และ process_message แยก task กัน ไม่ให้ block กัน
     if not is_dm and in_allowed and message.content.strip():
         asyncio.create_task(auto_react(message))
 
     if not is_dm and not in_allowed:
         return
 
+    # คำสั่ง owner เท่านั้น
     if message.author.id == OWNER_ID:
         if message.content == "!reset":
             user_histories.pop(message.author.id, None)
-            await message.reply("🔄 รีเซตแชทแล้ว!")
+            await message.reply("🔄 รีเซตแชทแล้วค่ะปะป๋า!")
             return
         if message.content == "!ping":
             await message.reply("🏓 Pong!")
@@ -563,9 +563,10 @@ async def on_message(message):
             )
             return
 
+    # คำสั่งทั่วไป
     if message.content == "!reset":
         user_histories.pop(message.author.id, None)
-        await message.reply("🔄 รีเซตแชทของคุณแล้ว!")
+        await message.reply("🔄 รีเซตแชทของคุณแล้วค่ะ!")
         return
 
     if message.content == "!help":
@@ -573,8 +574,8 @@ async def on_message(message):
             "**✨ SAI Bot — คำสั่งที่ใช้ได้**\n\n"
             "`!reset` — ล้างประวัติแชทของคุณ\n"
             "`!help` — แสดงคำสั่งนี้\n\n"
-            "หรือแค่พิมพ์ข้อความมาได้เลย!\n"
-            "บอทจะ react emoji ตามอารมณ์ข้อความอัตโนมัติด้วยนะ 😄"
+            "หรือแค่พิมพ์ข้อความมาได้เลยนะคะ!\n"
+            "ไซจะ react emoji ตามอารมณ์ข้อความอัตโนมัติด้วยนะ 😄"
         )
         return
 
