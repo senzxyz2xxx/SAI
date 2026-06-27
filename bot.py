@@ -210,18 +210,18 @@ def get_active_key_index():
 def parse_error(e: Exception) -> str:
     msg = str(e)
     if is_invalid_key_error(msg):
-        return "❌ API key ไม่ถูกต้อง/ไม่มีสิทธิ์ใช้งานอ่ะ ลองติดต่อท่านเซนนะ (เซนพิมพ์ `!testkeys` เพื่อเช็คได้เลย)"
+        return "อุ๊ย! มีปัญหานิดนึงค่ะ ขอเวลาจัดการแป๊บนึงนะคะ 🔧"
     if "429" in msg:
         if is_zero_quota_error(msg):
-            return "❌ quota เป็น 0 อ่ะ ลองสร้าง key ใหม่ที่ aistudio.google.com นะ"
+            return "อุ๊ย! มีปัญหานิดนึงค่ะ ขอเวลาจัดการแป๊บนึงนะคะ 🔧"
         if is_daily_quota_error(msg):
-            return "❌ quota วันนี้หมดแล้วอ่ะ รอรีเซตตอน 07:00 น. (UTC+7) นะ 🙏"
-        return "⏳ request เยอะเกินต่อนาทีอ่ะ รอแป๊บนึงแล้วลองใหม่นะ"
+            return "อุ๊ย! มีปัญหานิดนึงค่ะ ขอเวลาจัดการแป๊บนึงนะคะ 🔧"
+        return "⏳ เยอะไปนิดนึงค่ะ รอแป๊บแล้วลองใหม่นะคะ~"
     if "400" in msg:
-        return "❌ ข้อความนี้บอทรับไม่ได้อ่ะ ลองใหม่ด้วยข้อความอื่นนะ"
+        return "เอ๊ะ? ข้อความนี้ไซรับไม่ได้อ่ะค่ะ ลองใหม่ด้วยข้อความอื่นได้เลยนะคะ 🙏"
     if "500" in msg or "503" in msg:
-        return "❌ server Gemini มีปัญหาอ่ะ รอแป๊บแล้วลองใหม่นะ"
-    return f"❌ เกิด error อ่ะ: `{msg[:200]}`"
+        return "ว้าย! server มีปัญหานิดหน่อยค่ะ รอแป๊บแล้วลองใหม่นะคะ 🛠️"
+    return "อุ๊ย! เกิด error นิดนึงค่ะ ลองใหม่ได้เลยนะคะ~"
 
 
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
@@ -364,6 +364,8 @@ async def process_message(message, user_input):
                     invalid_keys.add(key_index)
                     remaining = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
                     print(f"[WARN] key {key_index + 1} invalid → ตัดออก (เหลือ {remaining} key(s))", flush=True)
+                    if remaining > 0:
+                        await message.channel.send("อุ๊ย! เกิดปัญหานิดนึงค่ะ ไซขอสลับโหมดแป๊บนึงนะคะ~ 🔄", delete_after=5)
                     continue
 
                 if "429" in err_msg:
@@ -375,6 +377,8 @@ async def process_message(message, user_input):
                         exhausted_keys.add(key_index)
                         remaining = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
                         print(f"[WARN] key {key_index + 1} daily quota หมด → blacklist (เหลือ {remaining} key(s))", flush=True)
+                        if remaining > 0:
+                            await message.channel.send("แป๊บนึงนะคะ ไซกำลังเปลี่ยนไปใช้ตัวสำรองอยู่ค่ะ~ ✨", delete_after=5)
                         continue
                     else:
                         print(f"[WARN] key {key_index + 1} rate limit ต่อนาที → รอ 3s", flush=True)
@@ -433,7 +437,7 @@ async def process_message(message, user_input):
         if last_error:
             await message.reply(parse_error(last_error))
         elif get_active_key_index() is None:
-            await message.reply("❌ ตอนนี้ไม่มี API key ที่ใช้งานได้เลยอ่ะ ลองติดต่อท่านเซนนะ (เซนพิมพ์ `!testkeys` เพื่อเช็คได้เลย)")
+            await message.reply("ว้ายยย! ไซเหนื่อยมากแล้วค่ะ ขอไปพักก่อนนะคะ เดี๋ยวเจอกันใหม่น้าา~ 💤")
     finally:
         typing_task.cancel()
         processing_users.discard(message.author.id)
@@ -682,6 +686,14 @@ async def on_message(message):
             user_histories.pop(message.author.id, None)
             await message.reply("🔄 รีเซตแชทแล้วค่ะปะป๋า!")
             return
+        if message.content.startswith("!resetuser "):
+            try:
+                target_id = int(message.content.split()[1])
+                user_histories.pop(target_id, None)
+                await message.reply(f"🔄 รีเซตแชทของ <@{target_id}> แล้วค่ะปะป๋า!")
+            except:
+                await message.reply("❌ ใช้แบบนี้นะคะ: `!resetuser <user_id>`")
+            return
         if message.content == "!ping":
             await message.reply("🏓 Pong!")
             return
@@ -711,21 +723,6 @@ async def on_message(message):
                 f"• รีเซตถัดไป: `{next_reset.strftime('%d/%m/%Y %H:%M')} น.` (อีก {reset_h}h {reset_m}m)"
             )
             return
-
-    if message.content == "!reset":
-        user_histories.pop(message.author.id, None)
-        await message.reply("🔄 รีเซตแชทของคุณแล้วค่ะ!")
-        return
-
-    if message.content == "!help":
-        await message.reply(
-            "**✨ SAI Bot — คำสั่งที่ใช้ได้**\n\n"
-            "`!reset` — ล้างประวัติแชทของคุณ\n"
-            "`!help` — แสดงคำสั่งนี้\n\n"
-            "หรือแค่พิมพ์ข้อความมาได้เลยนะคะ!\n"
-            "ส่งรูปมาได้เลย ไซดูรูปให้ได้นะ 🖼️"
-        )
-        return
 
     user_input = message.content.strip()
 
