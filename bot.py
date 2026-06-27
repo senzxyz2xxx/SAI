@@ -243,26 +243,29 @@ async def summarize_if_too_long(text: str) -> str:
         print(f"[SUMMARIZE ERROR] {e}", flush=True)
         return text[:MAX_REPLY_LENGTH] + "..."
 
+processing_messages = set()
+
 async def process_message(message, user_input):
     if message.author.id in processing_users:
         print(f"[SKIP] user {message.author.id} กำลัง process → skip", flush=True)
         return
+    if message.id in processing_messages:
+        print(f"[SKIP] message {message.id} กำลังประมวลผลค้างอยู่ → skip", flush=True)
+        return
     processing_users.add(message.author.id)
+    processing_messages.add(message.id)
     typing_task = asyncio.create_task(_keep_typing(message.channel))
     try:
         history = get_history(message.author.id)
-
         image_parts = []
         for att in message.attachments:
             result = await fetch_image_bytes(att.url)
             if result:
                 image_parts.append(result)
                 print(f"[IMG] {att.filename}", flush=True)
-
         has_images = bool(image_parts)
         if not has_images:
             history.append({"role": "user", "parts": [{"text": user_input}]})
-
         try:
             print("[INFO] กำลัง generate...", flush=True)
             if has_images:
@@ -270,7 +273,6 @@ async def process_message(message, user_input):
                 contents = build_contents_with_images(prompt_text, image_parts)
             else:
                 contents = history
-
             resp = await asyncio.to_thread(
                 get_genai_client().models.generate_content,
                 model=MODEL_NAME,
@@ -281,42 +283,34 @@ async def process_message(message, user_input):
                 ),
             )
             reply = resp.text
-
             if not has_images:
                 history.append({"role": "model", "parts": [{"text": reply}]})
                 trim_history(history)
-
             stats["total_requests"]   += 1
             stats["total_tokens_in"]  += count_tokens(user_input or "")
             stats["total_tokens_out"] += count_tokens(reply)
-
             reply = await summarize_if_too_long(reply)
             await message.reply(reply)
-
         except Exception as e:
             err_msg = str(e)
             print(f"[ERROR] {err_msg[:300]}", flush=True)
-
             if not has_images and history and history[-1]["role"] == "user":
                 history.pop()
-
             if is_daily_quota_error(err_msg):
                 reset_str = get_reset_time_str()
-                await message.reply(
-                    f"ว้ายยย! ไซขอพักก่อนนะคะ เหนื่อยมากเลยย~ 💤\n"
-                    f"เดี๋ยวไซตื่นใหม่ตอน **{reset_str} น.** แล้วเจอกันนะคะ!"
-                )
+                await message.reply(f"ว้ายยย! ไซขอพักก่อนนะคะ เหนื่อยมากเลยย~ 💤\nเดี๋ยวไซตื่นใหม่ตอน **{reset_str} น.** แล้วเจอกันนะคะ!")
             elif is_rate_limit_error(err_msg):
                 await message.reply("⏳ เยอะไปนิดนึงค่ะ รอแป๊บแล้วลองใหม่นะคะ~")
             elif "400" in err_msg:
                 await message.reply("เอ๊ะ? ข้อความนี้ไซรับไม่ได้อ่ะค่ะ ลองใหม่ด้วยข้อความอื่นได้เลยนะคะ 🙏")
-            elif "500" in err_msg or "503" in err_msg:
-                await message.reply("ว้าย! server มีปัญหานิดหน่อยค่ะ รอแป๊บแล้วลองใหม่นะคะ 🛠️")
+            elif "500" in err_msg or "503" in err_msg or "unavailable" in err_msg.lower():
+                await message.reply("ว้าย! ตอนนี้โมเดลคนใช้เยอะจนระบบเอ๋อ (503) ค่ะ รอแป๊บนึงแล้วลองใหม่นะคะ 🛠️")
             else:
                 await message.reply("อุ๊ย! เกิด error นิดนึงค่ะ ลองใหม่ได้เลยนะคะ~")
     finally:
         typing_task.cancel()
         processing_users.discard(message.author.id)
+        processing_messages.discard(message.id)
 
 async def test_key() -> str:
     try:
@@ -333,6 +327,8 @@ async def test_key() -> str:
             return f"⚠️ quota วันนี้หมดแล้วค่ะ: `{err[:150]}`"
         if is_rate_limit_error(err):
             return f"⏳ rate limit ชั่วคราว (key ยังใช้ได้): `{err[:150]}`"
+        if "503" in err or "unavailable" in err.lower():
+            return "🛠️ ระบบกูเกิลขัดข้องชั่วคราว (503 High Demand) แต่ตัว Key ปกติดีอยู่ค่ะ"
         return f"❌ error: `{err[:150]}`"
 
 async def reset_daily_stats():
