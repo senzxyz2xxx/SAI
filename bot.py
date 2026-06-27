@@ -99,7 +99,7 @@ if REDIS_URL:
 else:
     print("⚠️ ไม่มี REDIS_URL → ใช้ in-memory dedup แทน", flush=True)
 
-DEDUP_TTL = 30
+DEDUP_TTL = 60
 processed_messages: dict[int, float] = {}  # fallback ถ้าไม่มี Redis
 
 def check_and_mark(msg_id: int) -> bool:
@@ -121,7 +121,7 @@ def check_and_mark(msg_id: int) -> bool:
 
 # ===== กัน message ซ้ำระหว่าง deploy =====
 _bot_ready_time: float = 0.0
-STARTUP_IGNORE_SEC = 30
+STARTUP_IGNORE_SEC = 5  # แค่รอ Discord handoff สั้นๆ, instance เก่า exit เองผ่าน Redis
 # ==========================================
 
 def now_th():
@@ -644,16 +644,39 @@ def keep_alive():
     t.start()
 
 
+INSTANCE_ID = str(time.time())  # unique id ของ instance นี้
+
+async def _watch_instance_signal():
+    """instance เก่า: คอย Redis signal จาก instance ใหม่ แล้ว exit ทันที"""
+    while True:
+        await asyncio.sleep(2)
+        if not _redis:
+            return
+        try:
+            active = _redis.get("sai:active_instance")
+            if active and active != INSTANCE_ID:
+                print(f"[EXIT] instance ใหม่ขึ้นแล้ว ({active}) → instance นี้ออก", flush=True)
+                os._exit(0)
+        except:
+            pass
+
 @client.event
 async def on_ready():
     global _bot_ready_time
     print(f"✅ บอทออนไลน์แล้ว: {client.user} ({len(API_KEYS)} API key(s) โหลดแล้ว)", flush=True)
     print(f"🕐 เวลาไทยตอนนี้: {now_th().strftime('%d/%m/%Y %H:%M:%S')} น.", flush=True)
-    print(f"⏳ รอ {STARTUP_IGNORE_SEC}s ให้ instance เก่า disconnect...", flush=True)
+
+    # บอก instance เก่าว่าให้ออกได้เลย
+    if _redis:
+        _redis.set("sai:active_instance", INSTANCE_ID, ex=3600)
+        print(f"[HANDOFF] ส่ง signal ให้ instance เก่าออก (id={INSTANCE_ID})", flush=True)
+
+    print(f"⏳ รอ {STARTUP_IGNORE_SEC}s ให้ instance เก่า exit...", flush=True)
     await asyncio.sleep(STARTUP_IGNORE_SEC)
     _bot_ready_time = time.time()
     print("✅ พร้อมรับ message แล้ว!", flush=True)
     client.loop.create_task(reset_daily_stats())
+    client.loop.create_task(_watch_instance_signal())
 
 
 @client.event
