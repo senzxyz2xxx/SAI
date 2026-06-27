@@ -1,5 +1,6 @@
 import discord
-from groq import Groq, AuthenticationError, PermissionDeniedError, RateLimitError, APIConnectionError, APIStatusError
+from google import genai
+from google.genai import types
 import os
 import sys
 import datetime
@@ -19,9 +20,9 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = 1005357318281641994
 
 API_KEYS = [k for k in [
-    os.getenv("GROQ_API_KEY"),
-    os.getenv("GROQ_API_KEY_2"),
-    os.getenv("GROQ_API_KEY_3"),
+    os.getenv("GEMINI_API_KEY"),
+    os.getenv("GEMINI_API_KEY_2"),
+    os.getenv("GEMINI_API_KEY_3"),
 ] if k]
 
 ALLOWED_CHANNELS = [
@@ -30,8 +31,7 @@ ALLOWED_CHANNELS = [
     1520009829924474973,
 ]
 
-MODEL_NAME = "llama-3.3-70b-versatile"
-REACT_MODEL_NAME = "llama-3.1-8b-instant"
+MODEL_NAME = "gemini-2.5-flash"
 MAX_REPLY_TOKENS = 800
 HISTORY_LIMIT_PAIRS = 20
 
@@ -78,11 +78,11 @@ def now_th():
     return datetime.datetime.now(TZ_OFFSET)
 
 
-def get_client(key: str) -> Groq:
-    return Groq(api_key=key)
+def get_client(key: str) -> genai.Client:
+    return genai.Client(api_key=key)
 
 
-user_histories = {}
+user_histories = {}      # user_id -> [{"role": "user"/"model", "parts": [...]}]
 exhausted_keys = set()
 invalid_keys = set()
 processing_users = set()
@@ -123,9 +123,34 @@ def count_tokens(text):
         return 0
 
 
-def is_daily_quota_error(e: RateLimitError) -> bool:
-    msg = str(e).lower()
-    return "rpd" in msg or "requests per day" in msg or "daily" in msg
+def is_daily_quota_error(msg: str) -> bool:
+    msg_lower = msg.lower()
+    return any(x in msg_lower for x in [
+        "per_day", "perday", "daily", "quota exceeded",
+        "generaterequestsperdayperproject",
+        "resource_exhausted",
+    ]) or (
+        "429" in msg
+        and "per_minute" not in msg_lower
+        and "perminute" not in msg_lower
+    )
+
+
+def is_zero_quota_error(msg: str) -> bool:
+    return "limit: 0" in msg or "limit:0" in msg.replace(" ", "")
+
+
+def is_invalid_key_error(msg: str) -> bool:
+    msg_lower = msg.lower()
+    return (
+        "api_key_invalid" in msg_lower
+        or "api key not valid" in msg_lower
+        or "unauthenticated" in msg_lower
+        or ("invalid" in msg_lower and "key" in msg_lower)
+        or "401" in msg
+        or "403" in msg
+        or "permission_denied" in msg_lower
+    )
 
 
 def get_active_key_index():
@@ -136,17 +161,20 @@ def get_active_key_index():
 
 
 def parse_error(e: Exception) -> str:
-    if isinstance(e, (AuthenticationError, PermissionDeniedError)):
+    msg = str(e)
+    if is_invalid_key_error(msg):
         return "❌ API key ไม่ถูกต้อง/ไม่มีสิทธิ์ใช้งานอ่ะ ลองติดต่อท่านเซนนะ (เซนพิมพ์ `!testkeys` เพื่อเช็คได้เลย)"
-    if isinstance(e, RateLimitError):
-        if is_daily_quota_error(e):
+    if "429" in msg:
+        if is_zero_quota_error(msg):
+            return "❌ quota เป็น 0 อ่ะ ลองสร้าง key ใหม่ที่ aistudio.google.com นะ"
+        if is_daily_quota_error(msg):
             return "❌ quota วันนี้หมดแล้วอ่ะ รอรีเซตตอน 07:00 น. (UTC+7) นะ 🙏"
-        return "⏳ request เยอะเกินอ่ะ รอแป๊บนึงแล้วลองใหม่นะ"
-    if isinstance(e, APIConnectionError):
-        return "❌ เชื่อมต่อ Groq ไม่ได้อ่ะ เน็ตอาจมีปัญหา ลองใหม่อีกทีนะ"
-    if isinstance(e, APIStatusError):
-        return f"❌ เกิด error จาก Groq อ่ะ (status {e.status_code})"
-    return f"❌ เกิด error อ่ะ: `{str(e)[:200]}`"
+        return "⏳ request เยอะเกินต่อนาทีอ่ะ รอแป๊บนึงแล้วลองใหม่นะ"
+    if "400" in msg:
+        return "❌ ข้อความนี้บอทรับไม่ได้อ่ะ ลองใหม่ด้วยข้อความอื่นนะ"
+    if "500" in msg or "503" in msg:
+        return "❌ server Gemini มีปัญหาอ่ะ รอแป๊บแล้วลองใหม่นะ"
+    return f"❌ เกิด error อ่ะ: `{msg[:200]}`"
 
 
 async def auto_react(message):
@@ -163,15 +191,12 @@ async def auto_react(message):
 
         client_obj = get_client(API_KEYS[key_index])
         response = await asyncio.to_thread(
-            client_obj.chat.completions.create,
-            model=REACT_MODEL_NAME,
-            messages=[
-                {"role": "system", "content": REACT_SYSTEM_PROMPT},
-                {"role": "user", "content": message.content[:300]},
-            ],
-            max_tokens=10,
+            client_obj.models.generate_content,
+            model=MODEL_NAME,
+            contents=message.content[:300],
+            config=types.GenerateContentConfig(system_instruction=REACT_SYSTEM_PROMPT),
         )
-        emoji = response.choices[0].message.content.strip()
+        emoji = response.text.strip()
 
         if emoji and emoji != "NONE" and len(emoji) <= 8:
             await message.add_reaction(emoji)
@@ -205,7 +230,7 @@ async def process_message(message, user_input):
     try:
         last_error = None
         history = get_history(message.author.id)
-        history.append({"role": "user", "content": user_input})
+        history.append({"role": "user", "parts": [{"text": user_input}]})
 
         for key_index in range(len(API_KEYS)):
             if key_index in exhausted_keys or key_index in invalid_keys:
@@ -216,16 +241,18 @@ async def process_message(message, user_input):
                 print(f"[INFO] ลองใช้ key {key_index + 1}/{len(API_KEYS)} ({key[:8]}...)", flush=True)
 
                 client_obj = get_client(key)
-                messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
                 response = await asyncio.to_thread(
-                    client_obj.chat.completions.create,
+                    client_obj.models.generate_content,
                     model=MODEL_NAME,
-                    messages=messages,
-                    max_tokens=MAX_REPLY_TOKENS,
+                    contents=history,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        max_output_tokens=MAX_REPLY_TOKENS,
+                    ),
                 )
 
-                reply = response.choices[0].message.content
-                history.append({"role": "assistant", "content": reply})
+                reply = response.text
+                history.append({"role": "model", "parts": [{"text": reply}]})
                 trim_history(history)
 
                 stats["total_requests"] += 1
@@ -235,28 +262,32 @@ async def process_message(message, user_input):
                 await message.reply(reply[:1950] + "..." if len(reply) > 2000 else reply)
                 return
 
-            except (AuthenticationError, PermissionDeniedError) as e:
+            except Exception as e:
                 last_error = e
-                invalid_keys.add(key_index)
-                remaining = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
-                print(f"[WARN] key {key_index + 1} ใช้ไม่ได้ (invalid/permission): {e} → ตัดออก ลอง key ถัดไป (เหลือ {remaining} key(s) ใช้ได้)", flush=True)
-                continue
+                err_msg = str(e)
+                print(f"[ERROR] key {key_index + 1}: {err_msg[:500]}", flush=True)
 
-            except RateLimitError as e:
-                last_error = e
-                if is_daily_quota_error(e):
-                    exhausted_keys.add(key_index)
+                if is_invalid_key_error(err_msg):
+                    invalid_keys.add(key_index)
                     remaining = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
-                    print(f"[WARN] key {key_index + 1} daily quota หมด → blacklist (เหลือ {remaining} key(s) ใช้ได้)", flush=True)
-                    continue
-                else:
-                    print(f"[WARN] key {key_index + 1} rate limit ต่อนาที/วินาที → รอ 3s", flush=True)
-                    await asyncio.sleep(3)
+                    print(f"[WARN] key {key_index + 1} invalid → ตัดออก (เหลือ {remaining} key(s))", flush=True)
                     continue
 
-            except (APIConnectionError, APIStatusError, Exception) as e:
-                last_error = e
-                print(f"[ERROR] key {key_index + 1}: {str(e)[:500]}", flush=True)
+                if "429" in err_msg:
+                    if is_zero_quota_error(err_msg):
+                        invalid_keys.add(key_index)
+                        print(f"[WARN] key {key_index + 1} limit:0 → ตัดออก", flush=True)
+                        continue
+                    if is_daily_quota_error(err_msg):
+                        exhausted_keys.add(key_index)
+                        remaining = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
+                        print(f"[WARN] key {key_index + 1} daily quota หมด → blacklist (เหลือ {remaining} key(s))", flush=True)
+                        continue
+                    else:
+                        print(f"[WARN] key {key_index + 1} rate limit ต่อนาที → รอ 3s", flush=True)
+                        await asyncio.sleep(3)
+                        continue
+
                 break
 
         if history and history[-1]["role"] == "user":
@@ -281,26 +312,29 @@ async def test_all_keys() -> str:
         try:
             client_obj = get_client(key)
             response = await asyncio.to_thread(
-                client_obj.chat.completions.create,
+                client_obj.models.generate_content,
                 model=MODEL_NAME,
-                messages=[{"role": "user", "content": "ping"}],
-                max_tokens=5,
+                contents="ping",
             )
-            _ = response.choices[0].message.content
+            _ = response.text
             status = "✅ ใช้งานได้"
             invalid_keys.discard(i)
             if i in exhausted_keys:
-                status += " (แต่ก่อนหน้านี้โดน mark ว่า quota หมด ไม่ได้แก้อัตโนมัตินะ)"
-        except (AuthenticationError, PermissionDeniedError) as e:
-            status = f"❌ ใช้ไม่ได้ (invalid/permission): `{str(e)[:150]}`"
-            invalid_keys.add(i)
-        except RateLimitError as e:
-            if is_daily_quota_error(e):
-                status = f"⚠️ quota วันนี้หมด: `{str(e)[:150]}`"
-            else:
-                status = f"⏳ rate limit ต่อนาที (key ใช้ได้ แต่ชนลิมิตชั่วคราว): `{str(e)[:150]}`"
+                status += " (แต่ก่อนหน้านี้โดน mark ว่า quota หมด)"
         except Exception as e:
-            status = f"❌ error อื่น: `{str(e)[:150]}`"
+            err = str(e)
+            if is_invalid_key_error(err):
+                status = f"❌ ใช้ไม่ได้ (invalid): `{err[:150]}`"
+                invalid_keys.add(i)
+            elif "429" in err and is_zero_quota_error(err):
+                status = f"⚠️ limit:0 — quota เป็น 0: `{err[:150]}`"
+                invalid_keys.add(i)
+            elif "429" in err and is_daily_quota_error(err):
+                status = f"⚠️ quota วันนี้หมด: `{err[:150]}`"
+            elif "429" in err:
+                status = f"⏳ rate limit ชั่วคราว (key ใช้ได้): `{err[:150]}`"
+            else:
+                status = f"❌ error อื่น: `{err[:150]}`"
         lines.append(f"**{label}** — {status}")
 
     return "\n".join(lines)
@@ -416,8 +450,8 @@ def home():
         <div class="time-chip">⏳ รีเซตถัดไป: <span>{next_reset_str} น.</span> (อีก {reset_h}h {reset_m}m)</div>
     </div>
     <div class="model-card">
-        <div class="model-icon">⚡</div>
-        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Groq (LPU) — Chat + AI React</div></div>
+        <div class="model-icon">✨</div>
+        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + AI React</div></div>
         <div class="model-badge">Free Tier · {len(API_KEYS)} key(s) · {active_keys} active</div>
     </div>
     <div class="grid">
@@ -425,7 +459,7 @@ def home():
             <div class="card-icon">📨</div>
             <div class="card-label">Requests Today</div>
             <div class="card-value">{stats["total_requests"]}</div>
-            <div class="card-sub">เช็คโควต้าจริงที่ console.groq.com</div>
+            <div class="card-sub">จาก 500 req/วัน (ต่อ key)</div>
         </div>
         <div class="card">
             <div class="card-icon">🪙</div>
@@ -447,10 +481,10 @@ def home():
         </div>
     </div>
     <div class="limits-card">
-        <div class="limits-title">⚡ Groq Free Tier (เช็คจริงที่ console.groq.com/docs/rate-limits)</div>
-        <div class="limit-row"><span class="limit-label">Provider</span><span class="limit-val">Groq (LPU hardware)</span></div>
-        <div class="limit-row"><span class="limit-label">Chat model</span><span class="limit-val">{MODEL_NAME}</span></div>
-        <div class="limit-row"><span class="limit-label">React model</span><span class="limit-val">{REACT_MODEL_NAME}</span></div>
+        <div class="limits-title">✨ Gemini 2.5 Flash Free Tier (ต่อ key)</div>
+        <div class="limit-row"><span class="limit-label">Model</span><span class="limit-val">{MODEL_NAME}</span></div>
+        <div class="limit-row"><span class="limit-label">Requests / วัน</span><span class="limit-val">500 RPD</span></div>
+        <div class="limit-row"><span class="limit-label">Requests / นาที</span><span class="limit-val">10 RPM</span></div>
         <div class="limit-row"><span class="limit-label">API Keys ที่ใช้</span><span class="limit-val">{len(API_KEYS)} key(s)</span></div>
         <div class="limit-row"><span class="limit-label">Keys ที่ยัง active</span><span class="limit-val">{active_keys} key(s)</span></div>
         <div class="limit-row"><span class="limit-label">Keys quota หมด</span><span class="limit-val">{len(exhausted_keys)} key(s)</span></div>
@@ -519,7 +553,7 @@ async def on_message(message):
             active_keys = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
             await message.reply(
                 f"📊 **Stats**\n"
-                f"• Req: `{stats['total_requests']}`\n"
+                f"• Req: `{stats['total_requests']}` / 500\n"
                 f"• Tokens (ประมาณ): `{total_tokens:,}`\n"
                 f"• Reactions: `{stats['total_reactions']}`\n"
                 f"• Sessions: `{len(user_histories)}` users\n"
