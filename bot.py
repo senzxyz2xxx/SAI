@@ -396,6 +396,52 @@ async def process_message(message, user_input):
                         await asyncio.sleep(3)
                         continue
 
+                if "500" in err_msg or "503" in err_msg:
+                    # retry ซ้ำ key เดิมสูงสุด 3 ครั้ง ห่างกัน 5s
+                    retry_success = False
+                    for attempt in range(1, 4):
+                        print(f"[RETRY] key {key_index + 1} server error → retry {attempt}/3 รอ 5s", flush=True)
+                        await asyncio.sleep(5)
+                        try:
+                            if has_images:
+                                retry_resp = await asyncio.to_thread(
+                                    client_obj.models.generate_content,
+                                    model=MODEL_NAME,
+                                    contents=contents,
+                                    config=types.GenerateContentConfig(
+                                        system_instruction=SYSTEM_PROMPT,
+                                        max_output_tokens=MAX_REPLY_TOKENS,
+                                    ),
+                                )
+                            else:
+                                retry_resp = await asyncio.to_thread(
+                                    client_obj.models.generate_content,
+                                    model=MODEL_NAME,
+                                    contents=history,
+                                    config=types.GenerateContentConfig(
+                                        system_instruction=SYSTEM_PROMPT,
+                                        max_output_tokens=MAX_REPLY_TOKENS,
+                                    ),
+                                )
+                            reply = retry_resp.text
+                            if not has_images:
+                                history.append({"role": "model", "parts": [{"text": reply}]})
+                                trim_history(history)
+                            stats["total_requests"] += 1
+                            stats["total_tokens_in"] += count_tokens(user_input or "")
+                            stats["total_tokens_out"] += count_tokens(reply)
+                            reply = await summarize_if_too_long(reply, key_index)
+                            await message.reply(reply)
+                            retry_success = True
+                            break
+                        except Exception as retry_e:
+                            print(f"[RETRY] attempt {attempt} ล้มเหลว: {str(retry_e)[:200]}", flush=True)
+                            last_error = retry_e
+                    if retry_success:
+                        return
+                    # retry ครบแล้วยังไม่ได้ → ข้ามไป key ถัดไป
+                    continue
+
                 break
 
         if not has_images and history and history[-1]["role"] == "user":
