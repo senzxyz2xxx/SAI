@@ -10,6 +10,7 @@ import aiohttp
 from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
+from collections import deque
 import redis as redis_lib
 
 load_dotenv()
@@ -39,7 +40,7 @@ ALLOWED_CHANNELS = [
     1520009829924474973,
 ]
 
-MODEL_NAME         = "gemini-2.5-flash-lite"
+MODEL_NAME         = "gemini-2.0-flash"
 MAX_REPLY_TOKENS   = 800
 HISTORY_LIMIT_PAIRS = 20
 MAX_REPLY_LENGTH   = 1800
@@ -109,6 +110,25 @@ def check_and_mark(msg_id: int) -> bool:
     processed_messages[msg_id] = now_ts
     return False
 # =================
+
+# ===== Rate Limit =====
+# เก็บประวัติการใช้งาน 15 รายการล่าสุดในหน่วยความจำ
+request_history = deque(maxlen=15)
+
+async def check_rate_limit(message):
+    now = time.time()
+    # ลบข้อมูลที่เก่าเกิน 60 วินาทีทิ้งไป
+    while request_history and request_history[0] < now - 60:
+        request_history.popleft()
+
+    # ถ้าครบ 15 ครั้งใน 60 วินาที
+    if len(request_history) >= 15:
+        await message.reply("⏳ ไซขอพักหายใจแป๊บนะคะ! ปะป๋ารัวเร็วเกินไปแล้ววว~ (รออีกนิดนะคะ)")
+        return False
+
+    request_history.append(now)
+    return True
+# ======================
 
 # ===== Instance handoff =====
 INSTANCE_ID      = str(time.time())
@@ -255,6 +275,7 @@ async def process_message(message, user_input):
     processing_users.add(message.author.id)
     processing_messages.add(message.id)
     typing_task = asyncio.create_task(_keep_typing(message.channel))
+    await update_bot_status("playing")
     try:
         history = get_history(message.author.id)
         image_parts = []
@@ -298,6 +319,7 @@ async def process_message(message, user_input):
                 history.pop()
             if is_daily_quota_error(err_msg):
                 reset_str = get_reset_time_str()
+                await update_bot_status("resting")
                 await message.reply(f"ว้ายยย! ไซขอพักก่อนนะคะ เหนื่อยมากเลยย~ 💤\nเดี๋ยวไซตื่นใหม่ตอน **{reset_str} น.** แล้วเจอกันนะคะ!")
             elif is_rate_limit_error(err_msg):
                 await message.reply("⏳ เยอะไปนิดนึงค่ะ รอแป๊บแล้วลองใหม่นะคะ~")
@@ -311,6 +333,9 @@ async def process_message(message, user_input):
         typing_task.cancel()
         processing_users.discard(message.author.id)
         processing_messages.discard(message.id)
+        # คืนสถานะเป็น ready ถ้าไม่มีงานค้าง
+        if not processing_users:
+            await update_bot_status("ready")
 
 async def test_key() -> str:
     try:
@@ -332,13 +357,13 @@ async def test_key() -> str:
         return f"❌ error: `{err[:150]}`"
 
 async def update_bot_status(status_type: str):
-    status_map = {
-        "ready":   (discord.ActivityType.watching,   "ไซพร้อมซนแล้ว! | by senz"),
-        "resting": (discord.ActivityType.listening,  "ไซกำลังพักผ่อนอยู่~"),
-        "playing": (discord.ActivityType.playing,    "กำลังเล่นสนุก!"),
+    status_configs = {
+        "playing": (discord.ActivityType.playing,  "กำลังเล่นกับปะป๋า! | by senz"),
+        "resting": (discord.ActivityType.listening, "กำลังพักผ่อน... (Quota เต็ม) | by senz"),
+        "ready":   (discord.ActivityType.watching,  "พร้อมซนแล้ว! | by senz"),
     }
-    activity_type, name = status_map.get(status_type, status_map["ready"])
-    await client.change_presence(activity=discord.Activity(type=activity_type, name=name))
+    atype, name = status_configs.get(status_type, status_configs["ready"])
+    await client.change_presence(activity=discord.Activity(type=atype, name=name))
 
 
 async def reset_daily_stats():
@@ -358,7 +383,9 @@ async def reset_daily_stats():
         user_histories.clear()
         processing_users.clear()
         processed_messages.clear()
+        request_history.clear()
         print("[RESET] ✅ รีเซตแล้ว!", flush=True)
+        await update_bot_status("ready")
 
 # ===== Flask status page =====
 app = Flask('')
@@ -441,7 +468,7 @@ def home():
         <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + Vision</div></div>
     </div>
     <div class="grid">
-        <div class="card"><div class="card-icon">📨</div><div class="card-label">Requests Today</div><div class="card-value">{stats["total_requests"]}</div><div class="card-sub">จาก 1,000 req/วัน</div></div>
+        <div class="card"><div class="card-icon">📨</div><div class="card-label">Requests Today</div><div class="card-value">{stats["total_requests"]}</div><div class="card-sub">จาก 1,500 req/วัน</div></div>
         <div class="card"><div class="card-icon">🪙</div><div class="card-label">Tokens Today</div><div class="card-value">{total_tokens:,}</div><div class="card-sub">ประมาณจากความยาวข้อความ</div></div>
         <div class="card"><div class="card-icon">💬</div><div class="card-label">Active Sessions</div><div class="card-value">{len(user_histories)}</div><div class="card-sub">ผู้ใช้ที่มีประวัติแชทอยู่</div></div>
         <div class="card"><div class="card-icon">🔴</div><div class="card-label">Dedup (Redis)</div><div class="card-value" style="font-size:0.95rem;padding-top:4px">{redis_status}</div><div class="card-sub">กัน message ซ้ำข้าม instance</div></div>
@@ -449,7 +476,7 @@ def home():
     <div class="limits-card">
         <div class="limits-title">✨ Gemini Free Tier</div>
         <div class="limit-row"><span class="limit-label">Model</span><span class="limit-val">{MODEL_NAME}</span></div>
-        <div class="limit-row"><span class="limit-label">Requests / วัน</span><span class="limit-val">1,000 RPD</span></div>
+        <div class="limit-row"><span class="limit-label">Requests / วัน</span><span class="limit-val">1,500 RPD</span></div>
         <div class="limit-row"><span class="limit-label">Requests / นาที</span><span class="limit-val">15 RPM</span></div>
         <div class="limit-row"><span class="limit-label">Vision (อ่านรูป)</span><span class="limit-val">✅ รองรับ</span></div>
         <div class="limit-row"><span class="limit-label">รีเซต stats อัตโนมัติ</span><span class="limit-val reset-badge">ทุกวัน 07:00 น. (UTC+7)</span></div>
@@ -549,6 +576,9 @@ async def on_message(message):
 
     user_input = message.content.strip()
     if not user_input and not message.attachments:
+        return
+
+    if not await check_rate_limit(message):
         return
 
     await process_message(message, user_input)
