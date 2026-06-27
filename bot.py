@@ -135,8 +135,10 @@ async def _watch_instance_signal():
 def now_th():
     return datetime.datetime.now(TZ_OFFSET)
 
+_genai_client = genai.Client(api_key=GEMINI_API_KEY)
+
 def get_genai_client():
-    return genai.Client(api_key=GEMINI_API_KEY)
+    return _genai_client
 
 def get_reset_time_str() -> str:
     now = now_th()
