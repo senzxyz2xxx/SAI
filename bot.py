@@ -10,6 +10,7 @@ import aiohttp
 from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
+import redis
 
 load_dotenv()
 
@@ -74,16 +75,6 @@ SYSTEM_PROMPT = """
 - คุยได้ทุกเรื่อง ตามใจคนคุยได้เลย
 """
 
-REACT_SYSTEM_PROMPT = """
-คุณคือระบบเลือก emoji reaction สำหรับข้อความใน Discord
-หน้าที่: อ่านข้อความที่ผู้ใช้ส่งมา แล้ววิเคราะห์อารมณ์เพื่อตอบกลับด้วย emoji ที่เหมาะสมที่สุดเพียง "1 ตัวเท่านั้น"
-
-กฎเหล็ก:
-1. ห้ามตอบคำอธิบาย ห้ามใส่เครื่องหมายคำพูด ห้ามมีเว้นวรรค (Whitespace) ใดๆ ทั้งสิ้น
-2. ผลลัพธ์ที่ส่งกลับมาต้องมีเพียงแค่ตัว Emoji โดดๆ 1 ตัวเท่านั้น (เช่น 😂, 🔥, ❤️)
-3. หากข้อความนั้นไม่สามารถสื่อถึงอารมณ์ใดๆ หรือไม่เหมาะกับการใส่ emoji เลย ให้ตอบคำว่า NONE ตัวพิมพ์ใหญ่เท่านั้น
-"""
-
 SUMMARIZE_PROMPT = """
 คุณคือไซ บอท AI น่ารัก
 หน้าที่ของคุณคือสรุปข้อความด้านล่างนี้เนื่องจากมันยาวเกินไปสำหรับข้อจำกัดของ Discord
@@ -94,9 +85,43 @@ SUMMARIZE_PROMPT = """
 """
 # ============================
 
+# ===== Redis dedup =====
+_redis = None
+REDIS_URL = os.getenv("REDIS_URL")
+if REDIS_URL:
+    try:
+        _redis = redis.from_url(REDIS_URL, decode_responses=True)
+        _redis.ping()
+        print("✅ Redis connected", flush=True)
+    except Exception as e:
+        print(f"⚠️ Redis ใช้ไม่ได้ → fallback in-memory: {e}", flush=True)
+        _redis = None
+else:
+    print("⚠️ ไม่มี REDIS_URL → ใช้ in-memory dedup แทน", flush=True)
+
+DEDUP_TTL = 30
+processed_messages: dict[int, float] = {}  # fallback ถ้าไม่มี Redis
+
+def check_and_mark(msg_id: int) -> bool:
+    """Return True ถ้าซ้ำ (ควร skip), False ถ้าใหม่"""
+    if _redis:
+        key = f"sai:msg:{msg_id}"
+        result = _redis.set(key, 1, nx=True, ex=DEDUP_TTL)
+        return result is None  # None = key มีอยู่แล้ว = ซ้ำ
+    else:
+        now_ts = time.time()
+        expired = [k for k, v in processed_messages.items() if now_ts - v > DEDUP_TTL]
+        for k in expired:
+            del processed_messages[k]
+        if msg_id in processed_messages:
+            return True
+        processed_messages[msg_id] = now_ts
+        return False
+# =======================
+
 # ===== กัน message ซ้ำระหว่าง deploy =====
-_bot_ready_time: float = 0.0  # จะ set ตอน on_ready เสร็จ
-STARTUP_IGNORE_SEC = 30       # ละเว้น message ที่เกิดก่อน bot ready + buffer นี้
+_bot_ready_time: float = 0.0
+STARTUP_IGNORE_SEC = 30
 # ==========================================
 
 def now_th():
@@ -112,17 +137,10 @@ exhausted_keys = set()
 invalid_keys = set()
 processing_users = set()
 
-processed_messages: dict[int, float] = {}
-DEDUP_TTL = 30
-
-react_cooldown = {}
-REACT_COOLDOWN_SEC = 10
-
 stats = {
     "total_requests": 0,
     "total_tokens_in": 0,
     "total_tokens_out": 0,
-    "total_reactions": 0,
     "start_time": now_th(),
     "last_reset": now_th(),
 }
@@ -231,37 +249,6 @@ def build_contents_with_images(text: str, image_parts: list) -> list:
     if text:
         parts.append(types.Part.from_text(text=text))
     return [types.Content(role="user", parts=parts)]
-
-
-async def auto_react(message):
-    try:
-        if len(message.content.strip()) < 2:
-            return
-        now = time.time()
-        if now - react_cooldown.get(message.author.id, 0) < REACT_COOLDOWN_SEC:
-            return
-
-        key_index = get_active_key_index()
-        if key_index is None:
-            return
-
-        client_obj = get_client(API_KEYS[key_index])
-        response = await asyncio.to_thread(
-            client_obj.models.generate_content,
-            model=MODEL_NAME,
-            contents=message.content[:300],
-            config=types.GenerateContentConfig(system_instruction=REACT_SYSTEM_PROMPT),
-        )
-        emoji = response.text.strip()
-
-        if emoji and emoji != "NONE" and len(emoji) <= 8:
-            await message.add_reaction(emoji)
-            react_cooldown[message.author.id] = now
-            stats["total_reactions"] += 1
-            print(f"[REACT] '{message.content[:30]}' → {emoji}", flush=True)
-
-    except Exception as e:
-        print(f"[REACT ERROR] {e}", flush=True)
 
 
 async def _keep_typing(channel):
@@ -505,7 +492,6 @@ async def reset_daily_stats():
         stats["total_requests"] = 0
         stats["total_tokens_in"] = 0
         stats["total_tokens_out"] = 0
-        stats["total_reactions"] = 0
         stats["last_reset"] = now_th()
         user_histories.clear()
         exhausted_keys.clear()
@@ -536,6 +522,7 @@ def home():
 
     total_tokens = stats["total_tokens_in"] + stats["total_tokens_out"]
     active_keys = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
+    redis_status = "✅ Connected" if _redis else "⚠️ In-memory (ไม่มี Redis)"
 
     html = f"""<!DOCTYPE html>
 <html lang="th">
@@ -596,7 +583,7 @@ def home():
     </div>
     <div class="model-card">
         <div class="model-icon">✨</div>
-        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + Vision + AI React</div></div>
+        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + Vision</div></div>
         <div class="model-badge">Free Tier · {len(API_KEYS)} key(s) · {active_keys} active</div>
     </div>
     <div class="grid">
@@ -604,7 +591,7 @@ def home():
             <div class="card-icon">📨</div>
             <div class="card-label">Requests Today</div>
             <div class="card-value">{stats["total_requests"]}</div>
-            <div class="card-sub">จาก 500 req/วัน (ต่อ key)</div>
+            <div class="card-sub">จาก 1,000 req/วัน (ต่อ key)</div>
         </div>
         <div class="card">
             <div class="card-icon">🪙</div>
@@ -613,16 +600,16 @@ def home():
             <div class="card-sub">คำนวณคร่าวๆจากความยาวข้อความ</div>
         </div>
         <div class="card">
-            <div class="card-icon">😄</div>
-            <div class="card-label">AI Reactions</div>
-            <div class="card-value">{stats["total_reactions"]}</div>
-            <div class="card-sub">AI เลือก emoji เองตามบริบท</div>
-        </div>
-        <div class="card">
             <div class="card-icon">💬</div>
             <div class="card-label">Active Sessions</div>
             <div class="card-value">{len(user_histories)}</div>
             <div class="card-sub">ผู้ใช้ที่มีประวัติแชทอยู่</div>
+        </div>
+        <div class="card">
+            <div class="card-icon">🔴</div>
+            <div class="card-label">Dedup (Redis)</div>
+            <div class="card-value" style="font-size:0.95rem;padding-top:4px">{redis_status}</div>
+            <div class="card-sub">กัน message ซ้ำข้าม instance</div>
         </div>
     </div>
     <div class="limits-card">
@@ -658,7 +645,6 @@ async def on_ready():
     global _bot_ready_time
     print(f"✅ บอทออนไลน์แล้ว: {client.user} ({len(API_KEYS)} API key(s) โหลดแล้ว)", flush=True)
     print(f"🕐 เวลาไทยตอนนี้: {now_th().strftime('%d/%m/%Y %H:%M:%S')} น.", flush=True)
-    # รอให้ instance เก่า disconnect ก่อน — แก้ปัญหาตอบ 2 อัน
     print(f"⏳ รอ {STARTUP_IGNORE_SEC}s ให้ instance เก่า disconnect...", flush=True)
     await asyncio.sleep(STARTUP_IGNORE_SEC)
     _bot_ready_time = time.time()
@@ -671,38 +657,25 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # ===== รอจน on_ready sleep เสร็จก่อน =====
     if _bot_ready_time == 0.0:
-        return  # ยังอยู่ระหว่าง startup sleep
-    # ===========================================
+        return
 
-    # ===== กัน message ที่เกิดก่อน bot ready (ของ instance เก่า) =====
     msg_ts = message.created_at.timestamp()
     if msg_ts < _bot_ready_time - STARTUP_IGNORE_SEC:
         print(f"[SKIP] message เก่าก่อน startup → skip", flush=True)
         return
-    # =================================================================
 
     is_dm = isinstance(message.channel, discord.DMChannel)
     in_allowed = message.channel.id in ALLOWED_CHANNELS
 
-    if not is_dm and in_allowed and message.content.strip():
-        asyncio.create_task(auto_react(message))
-
     if not is_dm and not in_allowed:
         return
 
-    # ===== dedup =====
-    now_ts = time.time()
-    expired = [k for k, v in processed_messages.items() if now_ts - v > DEDUP_TTL]
-    for k in expired:
-        del processed_messages[k]
-
-    if message.id in processed_messages:
+    # ===== dedup (Redis หรือ in-memory) =====
+    if check_and_mark(message.id):
         print(f"[SKIP] message {message.id} ซ้ำ → skip", flush=True)
         return
-    processed_messages[message.id] = now_ts
-    # =================
+    # =========================================
 
     if message.author.id == OWNER_ID:
         if message.content == "!reset":
@@ -729,11 +702,11 @@ async def on_message(message):
             active_keys = len(API_KEYS) - len(exhausted_keys) - len(invalid_keys)
             await message.reply(
                 f"📊 **Stats**\n"
-                f"• Req: `{stats['total_requests']}` / 500\n"
+                f"• Req: `{stats['total_requests']}`\n"
                 f"• Tokens (ประมาณ): `{total_tokens:,}`\n"
-                f"• Reactions: `{stats['total_reactions']}`\n"
                 f"• Sessions: `{len(user_histories)}` users\n"
                 f"• API Keys: `{len(API_KEYS)}` key(s) · active: `{active_keys}` · quota หมด: `{len(exhausted_keys)}` · invalid: `{len(invalid_keys)}`\n"
+                f"• Redis: `{'✅' if _redis else '⚠️ in-memory'}`\n"
                 f"• เวลาไทย: `{now_th().strftime('%d/%m/%Y %H:%M')} น.`\n"
                 f"• รีเซตถัดไป: `{next_reset.strftime('%d/%m/%Y %H:%M')} น.` (อีก {reset_h}h {reset_m}m)"
             )
@@ -750,8 +723,7 @@ async def on_message(message):
             "`!reset` — ล้างประวัติแชทของคุณ\n"
             "`!help` — แสดงคำสั่งนี้\n\n"
             "หรือแค่พิมพ์ข้อความมาได้เลยนะคะ!\n"
-            "ส่งรูปมาได้เลย ไซดูรูปให้ได้นะ 🖼️\n"
-            "ไซจะ react emoji ตามอารมณ์ข้อความอัตโนมัติด้วยนะ 😄"
+            "ส่งรูปมาได้เลย ไซดูรูปให้ได้นะ 🖼️"
         )
         return
 
