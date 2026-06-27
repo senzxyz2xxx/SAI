@@ -6,6 +6,7 @@ import sys
 import datetime
 import time
 import asyncio
+import aiohttp
 from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
@@ -45,6 +46,7 @@ ALLOWED_CHANNELS = [
 MODEL_NAME = "gemini-2.5-flash"
 MAX_REPLY_TOKENS = 800
 HISTORY_LIMIT_PAIRS = 20
+MAX_REPLY_LENGTH = 1800  # ถ้าเกินนี้จะสรุปแทน
 
 TZ_OFFSET = datetime.timezone(datetime.timedelta(hours=7))
 
@@ -68,6 +70,7 @@ SYSTEM_PROMPT = """
 ─── ความสามารถ ───
 - คุยทั่วไป, เกม, หนัง, เพลง, อนิเมะ, ให้คำปรึกษา
 - แปลภาษา, ช่วยเขียน, สรุปข้อมูล
+- ดูรูปภาพและอธิบายสิ่งที่เห็นได้
 - คุยได้ทุกเรื่อง ตามใจคนคุยได้เลย
 """
 
@@ -76,6 +79,12 @@ REACT_SYSTEM_PROMPT = """
 อ่านข้อความแล้วตอบด้วย emoji ที่เหมาะสมที่สุด 1 ตัวเท่านั้น
 ห้ามตอบอะไรนอกจาก emoji ตัวเดียว ไม่มีข้อความ ไม่มีช่องว่าง
 ถ้าข้อความไม่เหมาะกับ emoji ใดเลย ให้ตอบว่า NONE
+"""
+
+SUMMARIZE_PROMPT = """
+คุณคือไซ บอท AI น่ารัก
+ข้อความนี้ยาวเกินไปสำหรับ Discord ให้สรุปใจความสำคัญให้กระชับ ไม่เกิน 1800 ตัวอักษร
+ยังคงสไตล์การพูดของไซไว้ พูดเหมือนเด็กผู้หญิงน่ารัก ใส่อารมณ์ได้
 """
 # ============================
 
@@ -187,6 +196,37 @@ def parse_error(e: Exception) -> str:
     return f"❌ เกิด error อ่ะ: `{msg[:200]}`"
 
 
+# ===== ดึงรูปจาก Discord attachment =====
+SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+async def fetch_image_bytes(url: str) -> tuple[bytes, str] | None:
+    """ดาวน์โหลดรูปจาก URL คืน (bytes, mime_type) หรือ None ถ้าล้มเหลว"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return None
+                content_type = resp.content_type.split(";")[0].strip()
+                if content_type not in SUPPORTED_IMAGE_TYPES:
+                    return None
+                data = await resp.read()
+                return data, content_type
+    except Exception as e:
+        print(f"[IMG FETCH ERROR] {e}", flush=True)
+        return None
+
+
+def build_contents_with_images(text: str, image_parts: list) -> list:
+    """สร้าง contents list สำหรับ Gemini ที่มีทั้งรูปและข้อความ"""
+    parts = []
+    for img_bytes, mime_type in image_parts:
+        parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime_type))
+    if text:
+        parts.append(types.Part.from_text(text=text))
+    return [types.Content(role="user", parts=parts)]
+# =========================================
+
+
 async def auto_react(message):
     try:
         if len(message.content.strip()) < 2:
@@ -229,6 +269,29 @@ async def _keep_typing(channel):
         print(f"[TYPING ERROR] {e}", flush=True)
 
 
+async def summarize_if_too_long(text: str, key_index: int) -> str:
+    """ถ้าข้อความยาวเกิน MAX_REPLY_LENGTH ให้ Gemini สรุปให้"""
+    if len(text) <= MAX_REPLY_LENGTH:
+        return text
+    print(f"[SUMMARIZE] ข้อความยาว {len(text)} ตัว → สรุป", flush=True)
+    try:
+        client_obj = get_client(API_KEYS[key_index])
+        response = await asyncio.to_thread(
+            client_obj.models.generate_content,
+            model=MODEL_NAME,
+            contents=f"สรุปข้อความนี้ให้กระชับไม่เกิน 1800 ตัวอักษร:\n\n{text}",
+            config=types.GenerateContentConfig(
+                system_instruction=SUMMARIZE_PROMPT,
+                max_output_tokens=600,
+            ),
+        )
+        summarized = response.text.strip()
+        return summarized if summarized else text[:MAX_REPLY_LENGTH] + "..."
+    except Exception as e:
+        print(f"[SUMMARIZE ERROR] {e}", flush=True)
+        return text[:MAX_REPLY_LENGTH] + "..."
+
+
 async def process_message(message, user_input):
     if message.author.id in processing_users:
         print(f"[SKIP] user {message.author.id} กำลัง process อยู่ → skip", flush=True)
@@ -240,7 +303,21 @@ async def process_message(message, user_input):
     try:
         last_error = None
         history = get_history(message.author.id)
-        history.append({"role": "user", "parts": [{"text": user_input}]})
+
+        # ===== ดึงรูปจาก attachments =====
+        image_parts = []
+        for attachment in message.attachments:
+            result = await fetch_image_bytes(attachment.url)
+            if result:
+                image_parts.append(result)
+                print(f"[IMG] โหลดรูป {attachment.filename} ({attachment.content_type})", flush=True)
+        # ==================================
+
+        # ถ้ามีรูป ให้ส่งเป็น multimodal (ไม่เก็บใน history เพราะ Gemini ไม่รองรับรูปใน turn เก่า)
+        has_images = len(image_parts) > 0
+
+        if not has_images:
+            history.append({"role": "user", "parts": [{"text": user_input}]})
 
         for key_index in range(len(API_KEYS)):
             if key_index in exhausted_keys or key_index in invalid_keys:
@@ -251,25 +328,46 @@ async def process_message(message, user_input):
                 print(f"[INFO] ลองใช้ key {key_index + 1}/{len(API_KEYS)} ({key[:8]}...)", flush=True)
 
                 client_obj = get_client(key)
-                response = await asyncio.to_thread(
-                    client_obj.models.generate_content,
-                    model=MODEL_NAME,
-                    contents=history,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        max_output_tokens=MAX_REPLY_TOKENS,
-                    ),
-                )
+
+                if has_images:
+                    # multimodal: ส่งรูป + ข้อความ (ไม่ใช้ history)
+                    prompt_text = user_input if user_input else "ช่วยดูรูปนี้ให้หน่อยนะคะ อธิบายว่าเห็นอะไรบ้าง"
+                    contents = build_contents_with_images(prompt_text, image_parts)
+                    response = await asyncio.to_thread(
+                        client_obj.models.generate_content,
+                        model=MODEL_NAME,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            max_output_tokens=MAX_REPLY_TOKENS,
+                        ),
+                    )
+                else:
+                    # text only: ใช้ history ปกติ
+                    response = await asyncio.to_thread(
+                        client_obj.models.generate_content,
+                        model=MODEL_NAME,
+                        contents=history,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            max_output_tokens=MAX_REPLY_TOKENS,
+                        ),
+                    )
 
                 reply = response.text
-                history.append({"role": "model", "parts": [{"text": reply}]})
-                trim_history(history)
+
+                if not has_images:
+                    history.append({"role": "model", "parts": [{"text": reply}]})
+                    trim_history(history)
 
                 stats["total_requests"] += 1
                 stats["total_tokens_in"] += count_tokens(user_input or "")
                 stats["total_tokens_out"] += count_tokens(reply)
 
-                await message.reply(reply[:1950] + "..." if len(reply) > 2000 else reply)
+                # สรุปถ้ายาวเกิน
+                reply = await summarize_if_too_long(reply, key_index)
+
+                await message.reply(reply)
                 return
 
             except Exception as e:
@@ -300,7 +398,7 @@ async def process_message(message, user_input):
 
                 break
 
-        if history and history[-1]["role"] == "user":
+        if not has_images and history and history[-1]["role"] == "user":
             history.pop()
 
         if last_error:
@@ -462,7 +560,7 @@ def home():
     </div>
     <div class="model-card">
         <div class="model-icon">✨</div>
-        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + AI React</div></div>
+        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + Vision + AI React</div></div>
         <div class="model-badge">Free Tier · {len(API_KEYS)} key(s) · {active_keys} active</div>
     </div>
     <div class="grid">
@@ -496,6 +594,7 @@ def home():
         <div class="limit-row"><span class="limit-label">Model</span><span class="limit-val">{MODEL_NAME}</span></div>
         <div class="limit-row"><span class="limit-label">Requests / วัน</span><span class="limit-val">500 RPD</span></div>
         <div class="limit-row"><span class="limit-label">Requests / นาที</span><span class="limit-val">10 RPM</span></div>
+        <div class="limit-row"><span class="limit-label">Vision (อ่านรูป)</span><span class="limit-val">✅ รองรับ</span></div>
         <div class="limit-row"><span class="limit-label">API Keys ที่ใช้</span><span class="limit-val">{len(API_KEYS)} key(s)</span></div>
         <div class="limit-row"><span class="limit-label">Keys ที่ยัง active</span><span class="limit-val">{active_keys} key(s)</span></div>
         <div class="limit-row"><span class="limit-label">Keys quota หมด</span><span class="limit-val">{len(exhausted_keys)} key(s)</span></div>
@@ -548,7 +647,6 @@ async def on_message(message):
 
     # ===== กันตอบซ้ำ message เดิม (dedup ด้วย timestamp) =====
     now_ts = time.time()
-    # ล้าง cache entry เก่าที่หมด TTL แล้ว
     expired = [k for k, v in processed_messages.items() if now_ts - v > DEDUP_TTL]
     for k in expired:
         del processed_messages[k]
@@ -605,12 +703,15 @@ async def on_message(message):
             "`!reset` — ล้างประวัติแชทของคุณ\n"
             "`!help` — แสดงคำสั่งนี้\n\n"
             "หรือแค่พิมพ์ข้อความมาได้เลยนะคะ!\n"
+            "ส่งรูปมาได้เลย ไซดูรูปให้ได้นะ 🖼️\n"
             "ไซจะ react emoji ตามอารมณ์ข้อความอัตโนมัติด้วยนะ 😄"
         )
         return
 
     user_input = message.content.strip()
-    if not user_input:
+
+    # ถ้าไม่มีทั้ง text และรูป → skip
+    if not user_input and not message.attachments:
         return
 
     await process_message(message, user_input)
