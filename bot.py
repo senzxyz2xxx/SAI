@@ -39,7 +39,7 @@ ALLOWED_CHANNELS = [
     1520009829924474973,
 ]
 
-MODEL_NAME         = "gemini-2.5-flash-lite"
+MODEL_NAME         = "gemini-2.0-flash"
 MAX_REPLY_TOKENS   = 800
 HISTORY_LIMIT_PAIRS = 20
 MAX_REPLY_LENGTH   = 1800
