@@ -39,7 +39,7 @@ ALLOWED_CHANNELS = [
     1520009829924474973,
 ]
 
-MODEL_NAME         = "gemini-2.0-flash"
+MODEL_NAME         = "gemini-2.5-flash-lite"
 MAX_REPLY_TOKENS   = 800
 HISTORY_LIMIT_PAIRS = 20
 MAX_REPLY_LENGTH   = 1800
@@ -331,6 +331,16 @@ async def test_key() -> str:
             return "🛠️ ระบบกูเกิลขัดข้องชั่วคราว (503 High Demand) แต่ตัว Key ปกติดีอยู่ค่ะ"
         return f"❌ error: `{err[:150]}`"
 
+async def update_bot_status(status_type: str):
+    status_map = {
+        "ready":   (discord.ActivityType.watching,   "ไซพร้อมซนแล้ว! | by senz"),
+        "resting": (discord.ActivityType.listening,  "ไซกำลังพักผ่อนอยู่~"),
+        "playing": (discord.ActivityType.playing,    "กำลังเล่นสนุก!"),
+    }
+    activity_type, name = status_map.get(status_type, status_map["ready"])
+    await client.change_presence(activity=discord.Activity(type=activity_type, name=name))
+
+
 async def reset_daily_stats():
     await client.wait_until_ready()
     while not client.is_closed():
@@ -471,6 +481,7 @@ async def on_ready():
     await asyncio.sleep(STARTUP_IGNORE_SEC)
     _bot_ready_time = time.time()
     print("✅ พร้อมรับ message แล้ว!", flush=True)
+    await update_bot_status("ready")
     client.loop.create_task(reset_daily_stats())
     client.loop.create_task(_watch_instance_signal())
 
