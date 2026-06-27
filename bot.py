@@ -15,6 +15,17 @@ load_dotenv()
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
+# ===== INSTANCE LOCK — กันรันสองตัวพร้อมกัน =====
+import fcntl
+_lock_file = open("/tmp/sai_bot.lock", "w")
+try:
+    fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print("✅ Instance lock acquired", flush=True)
+except BlockingIOError:
+    print("❌ Bot instance อื่นรันอยู่แล้ว → ออกเลย", flush=True)
+    sys.exit(0)
+# ==================================================
+
 # ========== CONFIG ==========
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = 1005357318281641994
