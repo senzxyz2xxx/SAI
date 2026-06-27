@@ -434,10 +434,20 @@ async def process_message(message, user_input):
         if not has_images and history and history[-1]["role"] == "user":
             history.pop()
 
+        # ถ้า instance ใหม่ขึ้นมาแล้ว ไม่ส่ง error — ปล่อยให้ instance ใหม่จัดการ
+        if _redis:
+            try:
+                active = _redis.get("sai:active_instance")
+                if active and active != INSTANCE_ID:
+                    print(f"[SKIP ERROR] instance ใหม่ขึ้นแล้ว → ไม่ส่ง error", flush=True)
+                    return
+            except:
+                pass
+
         if last_error:
             await message.reply(parse_error(last_error))
         elif get_active_key_index() is None:
-            await message.reply("ว้ายยย! ไซเหนื่อยมากแล้วค่ะ ขอไปพักก่อนนะคะ เดี๋ยวเจอกันใหม่น้าา~ 💤")
+            await message.reply("ว้ายยย! ไซเหนื่อยมากแล้วค่ะ ขอไปพักก่อนนะค่ะ เดี๋ยวเจอกันใหม่น้าา~ 💤")
     finally:
         typing_task.cancel()
         processing_users.discard(message.author.id)
