@@ -10,7 +10,7 @@ import aiohttp
 from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
-import redis
+import redis as redis_lib
 
 load_dotenv()
 
@@ -29,9 +29,9 @@ except BlockingIOError:
 # =========================
 
 # ========== CONFIG ==========
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-OWNER_ID = 1005357318281641994
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DISCORD_TOKEN   = os.getenv("DISCORD_TOKEN")
+OWNER_ID        = 1005357318281641994
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
 
 ALLOWED_CHANNELS = [
     1518970044925739160,
@@ -39,11 +39,11 @@ ALLOWED_CHANNELS = [
     1520009829924474973,
 ]
 
-MODEL_NAME = "gemini-2.5-flash-lite"
-MAX_REPLY_TOKENS = 800
+MODEL_NAME         = "gemini-2.5-flash-lite"
+MAX_REPLY_TOKENS   = 800
 HISTORY_LIMIT_PAIRS = 20
-MAX_REPLY_LENGTH = 1800
-TZ_OFFSET = datetime.timezone(datetime.timedelta(hours=7))
+MAX_REPLY_LENGTH   = 1800
+TZ_OFFSET          = datetime.timezone(datetime.timedelta(hours=7))
 
 SYSTEM_PROMPT = """
 คุณคือ SAI (ไซ) บอท AI ประจำเซิร์ฟเวอร์ Discord
@@ -79,12 +79,12 @@ SUMMARIZE_PROMPT = """
 """
 # ============================
 
-# ===== Redis dedup =====
+# ===== Redis =====
 _redis = None
 REDIS_URL = os.getenv("REDIS_URL")
 if REDIS_URL:
     try:
-        _redis = redis.from_url(REDIS_URL, decode_responses=True)
+        _redis = redis_lib.from_url(REDIS_URL, decode_responses=True)
         _redis.ping()
         print("✅ Redis connected", flush=True)
     except Exception as e:
@@ -97,27 +97,28 @@ DEDUP_TTL = 60
 processed_messages: dict[int, float] = {}
 
 def check_and_mark(msg_id: int) -> bool:
+    """True = ซ้ำ ควร skip, False = ใหม่ ให้ process"""
     if _redis:
-        key = f"sai:msg:{msg_id}"
-        result = _redis.set(key, 1, nx=True, ex=DEDUP_TTL)
+        result = _redis.set(f"sai:msg:{msg_id}", 1, nx=True, ex=DEDUP_TTL)
         return result is None
-    else:
-        now_ts = time.time()
-        expired = [k for k, v in processed_messages.items() if now_ts - v > DEDUP_TTL]
-        for k in expired:
-            del processed_messages[k]
-        if msg_id in processed_messages:
-            return True
-        processed_messages[msg_id] = now_ts
-        return False
-# =======================
+    now_ts = time.time()
+    for k in [k for k, v in processed_messages.items() if now_ts - v > DEDUP_TTL]:
+        del processed_messages[k]
+    if msg_id in processed_messages:
+        return True
+    processed_messages[msg_id] = now_ts
+    return False
+# =================
 
 # ===== Instance handoff =====
-INSTANCE_ID = str(time.time())
-_bot_ready_time: float = 0.0
+INSTANCE_ID      = str(time.time())
+_bot_ready_time  : float = 0.0
 STARTUP_IGNORE_SEC = 5
 
 async def _watch_instance_signal():
+    """รอให้ _bot_ready_time set ก่อน แล้วค่อย watch"""
+    while _bot_ready_time == 0.0:
+        await asyncio.sleep(1)
     while True:
         await asyncio.sleep(2)
         if not _redis:
@@ -127,7 +128,7 @@ async def _watch_instance_signal():
             if active and active != INSTANCE_ID:
                 print(f"[EXIT] instance ใหม่ขึ้นแล้ว → ออก", flush=True)
                 os._exit(0)
-        except:
+        except Exception:
             pass
 # ============================
 
@@ -137,45 +138,6 @@ def now_th():
 def get_genai_client():
     return genai.Client(api_key=GEMINI_API_KEY)
 
-user_histories = {}
-processing_users = set()
-
-stats = {
-    "total_requests": 0,
-    "total_tokens_in": 0,
-    "total_tokens_out": 0,
-    "start_time": now_th(),
-    "last_reset": now_th(),
-}
-
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-client = discord.Client(intents=intents)
-
-
-def get_history(user_id: int) -> list:
-    if user_id not in user_histories:
-        user_histories[user_id] = []
-    return user_histories[user_id]
-
-
-def trim_history(history: list):
-    max_messages = HISTORY_LIMIT_PAIRS * 2
-    if len(history) > max_messages:
-        del history[: len(history) - max_messages]
-
-
-def count_tokens(text):
-    return len(text) // 4
-
-
-def is_quota_error(msg: str) -> bool:
-    msg_lower = msg.lower()
-    return "resource_exhausted" in msg_lower or (
-        "429" in msg and "per_minute" not in msg_lower
-    )
-
 def get_reset_time_str() -> str:
     now = now_th()
     next_reset = now.replace(hour=7, minute=0, second=0, microsecond=0)
@@ -183,6 +145,50 @@ def get_reset_time_str() -> str:
         next_reset += datetime.timedelta(days=1)
     return next_reset.strftime("%d/%m/%Y %H:%M")
 
+def is_daily_quota_error(msg: str) -> bool:
+    """quota วันหมด (ไม่ใช่ rate limit ต่อนาที)"""
+    lower = msg.lower()
+    return (
+        "resource_exhausted" in lower
+        or "per_day" in lower
+        or "daily" in lower
+        or "quota exceeded" in lower
+        or ("429" in msg and "per_minute" not in lower and "perminute" not in lower)
+    )
+
+def is_rate_limit_error(msg: str) -> bool:
+    """rate limit ต่อนาที (ชั่วคราว)"""
+    lower = msg.lower()
+    return "429" in msg and ("per_minute" in lower or "perminute" in lower)
+
+user_histories   = {}
+processing_users = set()
+
+stats = {
+    "total_requests"  : 0,
+    "total_tokens_in" : 0,
+    "total_tokens_out": 0,
+    "start_time"      : now_th(),
+    "last_reset"      : now_th(),
+}
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+client = discord.Client(intents=intents)
+
+def get_history(user_id: int) -> list:
+    if user_id not in user_histories:
+        user_histories[user_id] = []
+    return user_histories[user_id]
+
+def trim_history(history: list):
+    max_messages = HISTORY_LIMIT_PAIRS * 2
+    if len(history) > max_messages:
+        del history[: len(history) - max_messages]
+
+def count_tokens(text: str) -> int:
+    return len(text) // 4
 
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
@@ -192,24 +198,19 @@ async def fetch_image_bytes(url: str) -> tuple[bytes, str] | None:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
                     return None
-                content_type = resp.content_type.split(";")[0].strip()
-                if content_type not in SUPPORTED_IMAGE_TYPES:
+                ct = resp.content_type.split(";")[0].strip()
+                if ct not in SUPPORTED_IMAGE_TYPES:
                     return None
-                data = await resp.read()
-                return data, content_type
+                return await resp.read(), ct
     except Exception as e:
         print(f"[IMG FETCH ERROR] {e}", flush=True)
         return None
 
-
 def build_contents_with_images(text: str, image_parts: list) -> list:
-    parts = []
-    for img_bytes, mime_type in image_parts:
-        parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime_type))
+    parts = [types.Part.from_bytes(data=b, mime_type=m) for b, m in image_parts]
     if text:
         parts.append(types.Part.from_text(text=text))
     return [types.Content(role="user", parts=parts)]
-
 
 async def _keep_typing(channel):
     try:
@@ -221,15 +222,13 @@ async def _keep_typing(channel):
     except Exception as e:
         print(f"[TYPING ERROR] {e}", flush=True)
 
-
 async def summarize_if_too_long(text: str) -> str:
     if len(text) <= MAX_REPLY_LENGTH:
         return text
-    print(f"[SUMMARIZE] ข้อความยาว {len(text)} ตัว → สรุป", flush=True)
+    print(f"[SUMMARIZE] ยาว {len(text)} ตัว → สรุป", flush=True)
     try:
-        genai_client = get_genai_client()
-        response = await asyncio.to_thread(
-            genai_client.models.generate_content,
+        resp = await asyncio.to_thread(
+            get_genai_client().models.generate_content,
             model=MODEL_NAME,
             contents=f"สรุปข้อความนี้ให้กระชับไม่เกิน 1800 ตัวอักษร:\n\n{text}",
             config=types.GenerateContentConfig(
@@ -237,70 +236,56 @@ async def summarize_if_too_long(text: str) -> str:
                 max_output_tokens=600,
             ),
         )
-        summarized = response.text.strip()
-        return summarized if summarized else text[:MAX_REPLY_LENGTH] + "..."
+        return resp.text.strip() or text[:MAX_REPLY_LENGTH] + "..."
     except Exception as e:
         print(f"[SUMMARIZE ERROR] {e}", flush=True)
         return text[:MAX_REPLY_LENGTH] + "..."
 
-
 async def process_message(message, user_input):
     if message.author.id in processing_users:
-        print(f"[SKIP] user {message.author.id} กำลัง process อยู่ → skip", flush=True)
+        print(f"[SKIP] user {message.author.id} กำลัง process → skip", flush=True)
         return
     processing_users.add(message.author.id)
     typing_task = asyncio.create_task(_keep_typing(message.channel))
-
     try:
         history = get_history(message.author.id)
 
         image_parts = []
-        for attachment in message.attachments:
-            result = await fetch_image_bytes(attachment.url)
+        for att in message.attachments:
+            result = await fetch_image_bytes(att.url)
             if result:
                 image_parts.append(result)
-                print(f"[IMG] โหลดรูป {attachment.filename}", flush=True)
+                print(f"[IMG] {att.filename}", flush=True)
 
-        has_images = len(image_parts) > 0
-
+        has_images = bool(image_parts)
         if not has_images:
             history.append({"role": "user", "parts": [{"text": user_input}]})
 
         try:
-            genai_client = get_genai_client()
-            print(f"[INFO] กำลัง generate...", flush=True)
-
+            print("[INFO] กำลัง generate...", flush=True)
             if has_images:
-                prompt_text = user_input if user_input else "ช่วยดูรูปนี้ให้หน่อยนะคะ อธิบายว่าเห็นอะไรบ้าง"
+                prompt_text = user_input or "ช่วยดูรูปนี้ให้หน่อยนะคะ อธิบายว่าเห็นอะไรบ้าง"
                 contents = build_contents_with_images(prompt_text, image_parts)
-                response = await asyncio.to_thread(
-                    genai_client.models.generate_content,
-                    model=MODEL_NAME,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        max_output_tokens=MAX_REPLY_TOKENS,
-                    ),
-                )
             else:
-                response = await asyncio.to_thread(
-                    genai_client.models.generate_content,
-                    model=MODEL_NAME,
-                    contents=history,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        max_output_tokens=MAX_REPLY_TOKENS,
-                    ),
-                )
+                contents = history
 
-            reply = response.text
+            resp = await asyncio.to_thread(
+                get_genai_client().models.generate_content,
+                model=MODEL_NAME,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    max_output_tokens=MAX_REPLY_TOKENS,
+                ),
+            )
+            reply = resp.text
 
             if not has_images:
                 history.append({"role": "model", "parts": [{"text": reply}]})
                 trim_history(history)
 
-            stats["total_requests"] += 1
-            stats["total_tokens_in"] += count_tokens(user_input or "")
+            stats["total_requests"]   += 1
+            stats["total_tokens_in"]  += count_tokens(user_input or "")
             stats["total_tokens_out"] += count_tokens(reply)
 
             reply = await summarize_if_too_long(reply)
@@ -313,13 +298,13 @@ async def process_message(message, user_input):
             if not has_images and history and history[-1]["role"] == "user":
                 history.pop()
 
-            if is_quota_error(err_msg):
+            if is_daily_quota_error(err_msg):
                 reset_str = get_reset_time_str()
                 await message.reply(
                     f"ว้ายยย! ไซขอพักก่อนนะคะ เหนื่อยมากเลยย~ 💤\n"
                     f"เดี๋ยวไซตื่นใหม่ตอน **{reset_str} น.** แล้วเจอกันนะคะ!"
                 )
-            elif "429" in err_msg:
+            elif is_rate_limit_error(err_msg):
                 await message.reply("⏳ เยอะไปนิดนึงค่ะ รอแป๊บแล้วลองใหม่นะคะ~")
             elif "400" in err_msg:
                 await message.reply("เอ๊ะ? ข้อความนี้ไซรับไม่ได้อ่ะค่ะ ลองใหม่ด้วยข้อความอื่นได้เลยนะคะ 🙏")
@@ -327,11 +312,26 @@ async def process_message(message, user_input):
                 await message.reply("ว้าย! server มีปัญหานิดหน่อยค่ะ รอแป๊บแล้วลองใหม่นะคะ 🛠️")
             else:
                 await message.reply("อุ๊ย! เกิด error นิดนึงค่ะ ลองใหม่ได้เลยนะคะ~")
-
     finally:
         typing_task.cancel()
         processing_users.discard(message.author.id)
 
+async def test_key() -> str:
+    try:
+        resp = await asyncio.to_thread(
+            get_genai_client().models.generate_content,
+            model=MODEL_NAME,
+            contents="ping",
+        )
+        _ = resp.text
+        return "✅ ใช้งานได้ปกติค่ะ"
+    except Exception as e:
+        err = str(e)
+        if is_daily_quota_error(err):
+            return f"⚠️ quota วันนี้หมดแล้วค่ะ: `{err[:150]}`"
+        if is_rate_limit_error(err):
+            return f"⏳ rate limit ชั่วคราว (key ยังใช้ได้): `{err[:150]}`"
+        return f"❌ error: `{err[:150]}`"
 
 async def reset_daily_stats():
     await client.wait_until_ready()
@@ -343,35 +343,35 @@ async def reset_daily_stats():
         wait_seconds = (next_reset - now).total_seconds()
         print(f"[RESET] จะรีเซตในอีก {wait_seconds/3600:.1f}h", flush=True)
         await asyncio.sleep(wait_seconds)
-        stats["total_requests"] = 0
-        stats["total_tokens_in"] = 0
+        stats["total_requests"]   = 0
+        stats["total_tokens_in"]  = 0
         stats["total_tokens_out"] = 0
         stats["last_reset"] = now_th()
         user_histories.clear()
         processing_users.clear()
         processed_messages.clear()
-        print(f"[RESET] ✅ รีเซตแล้ว!", flush=True)
+        print("[RESET] ✅ รีเซตแล้ว!", flush=True)
 
-
+# ===== Flask status page =====
 app = Flask('')
 
 @app.route('/')
 def home():
     uptime = now_th() - stats["start_time"]
-    hours, remainder = divmod(int(uptime.total_seconds()), 3600)
-    minutes, seconds = divmod(remainder, 60)
-    current_th = now_th().strftime("%d/%m/%Y %H:%M:%S")
+    h, rem = divmod(int(uptime.total_seconds()), 3600)
+    m, s   = divmod(rem, 60)
+    current_th   = now_th().strftime("%d/%m/%Y %H:%M:%S")
     last_reset_th = stats["last_reset"].strftime("%d/%m/%Y %H:%M")
     _now = now_th()
     next_reset = _now.replace(hour=7, minute=0, second=0, microsecond=0)
     if _now >= next_reset:
         next_reset += datetime.timedelta(days=1)
-    time_to_reset = next_reset - _now
-    reset_h, reset_rem = divmod(int(time_to_reset.total_seconds()), 3600)
-    reset_m = reset_rem // 60
+    ttr = next_reset - _now
+    rh, rrem = divmod(int(ttr.total_seconds()), 3600)
+    rm = rrem // 60
     next_reset_str = next_reset.strftime("%d/%m/%Y %H:%M")
-    total_tokens = stats["total_tokens_in"] + stats["total_tokens_out"]
-    redis_status = "✅ Connected" if _redis else "⚠️ In-memory"
+    total_tokens   = stats["total_tokens_in"] + stats["total_tokens_out"]
+    redis_status   = "✅ Connected" if _redis else "⚠️ In-memory"
 
     html = f"""<!DOCTYPE html>
 <html lang="th">
@@ -408,7 +408,7 @@ def home():
         .limits-card {{ background: #13131f; border: 1px solid #1e1e30; border-radius: 16px; padding: 20px; margin-bottom: 14px; }}
         .limits-title {{ font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: #475569; margin-bottom: 14px; }}
         .limit-row {{ display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #1e1e30; }}
-        .limit-row:last-child {{ border-bottom: none; }}
+        .limit-row:last-child {{ border-bottom: none; padding-bottom: 0; }}
         .limit-label {{ font-size: 0.85rem; color: #94a3b8; }}
         .limit-val {{ font-size: 0.85rem; font-weight: 600; color: #e2e8f0; }}
         .reset-badge {{ color: #fbbf24; font-weight: 600; }}
@@ -422,41 +422,21 @@ def home():
         <div class="avatar">🤖</div>
         <div class="header-text"><h1>SAI Bot</h1><p>Discord AI Assistant</p></div>
     </div>
-    <div class="status-badge"><div class="dot"></div>Online — Uptime {hours}h {minutes}m {seconds}s</div>
+    <div class="status-badge"><div class="dot"></div>Online — Uptime {h}h {m}m {s}s</div>
     <div class="time-row">
-        <div class="time-chip">🕐 เวลาไทย (UTC+7): <span>{current_th} น.</span></div>
+        <div class="time-chip">🕐 เวลาไทย: <span>{current_th} น.</span></div>
         <div class="time-chip">🔄 รีเซตล่าสุด: <span>{last_reset_th} น.</span></div>
-        <div class="time-chip">⏳ รีเซตถัดไป: <span>{next_reset_str} น.</span> (อีก {reset_h}h {reset_m}m)</div>
+        <div class="time-chip">⏳ รีเซตถัดไป: <span>{next_reset_str} น.</span> (อีก {rh}h {rm}m)</div>
     </div>
     <div class="model-card">
         <div class="model-icon">✨</div>
         <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + Vision</div></div>
     </div>
     <div class="grid">
-        <div class="card">
-            <div class="card-icon">📨</div>
-            <div class="card-label">Requests Today</div>
-            <div class="card-value">{stats["total_requests"]}</div>
-            <div class="card-sub">จาก 1,000 req/วัน</div>
-        </div>
-        <div class="card">
-            <div class="card-icon">🪙</div>
-            <div class="card-label">Tokens Today (ประมาณ)</div>
-            <div class="card-value">{total_tokens:,}</div>
-            <div class="card-sub">คำนวณคร่าวๆ จากความยาวข้อความ</div>
-        </div>
-        <div class="card">
-            <div class="card-icon">💬</div>
-            <div class="card-label">Active Sessions</div>
-            <div class="card-value">{len(user_histories)}</div>
-            <div class="card-sub">ผู้ใช้ที่มีประวัติแชทอยู่</div>
-        </div>
-        <div class="card">
-            <div class="card-icon">🔴</div>
-            <div class="card-label">Dedup (Redis)</div>
-            <div class="card-value" style="font-size:0.95rem;padding-top:4px">{redis_status}</div>
-            <div class="card-sub">กัน message ซ้ำข้าม instance</div>
-        </div>
+        <div class="card"><div class="card-icon">📨</div><div class="card-label">Requests Today</div><div class="card-value">{stats["total_requests"]}</div><div class="card-sub">จาก 1,000 req/วัน</div></div>
+        <div class="card"><div class="card-icon">🪙</div><div class="card-label">Tokens Today</div><div class="card-value">{total_tokens:,}</div><div class="card-sub">ประมาณจากความยาวข้อความ</div></div>
+        <div class="card"><div class="card-icon">💬</div><div class="card-label">Active Sessions</div><div class="card-value">{len(user_histories)}</div><div class="card-sub">ผู้ใช้ที่มีประวัติแชทอยู่</div></div>
+        <div class="card"><div class="card-icon">🔴</div><div class="card-label">Dedup (Redis)</div><div class="card-value" style="font-size:0.95rem;padding-top:4px">{redis_status}</div><div class="card-sub">กัน message ซ้ำข้าม instance</div></div>
     </div>
     <div class="limits-card">
         <div class="limits-title">✨ Gemini Free Tier</div>
@@ -466,7 +446,7 @@ def home():
         <div class="limit-row"><span class="limit-label">Vision (อ่านรูป)</span><span class="limit-val">✅ รองรับ</span></div>
         <div class="limit-row"><span class="limit-label">รีเซต stats อัตโนมัติ</span><span class="limit-val reset-badge">ทุกวัน 07:00 น. (UTC+7)</span></div>
     </div>
-    <div class="footer">หน้านี้รีเฟรชอัตโนมัติทุก 30 วินาที • เวลาทั้งหมดเป็น UTC+7</div>
+    <div class="footer">รีเฟรชอัตโนมัติทุก 30 วินาที • เวลาทั้งหมดเป็น UTC+7</div>
 </div>
 </body>
 </html>"""
@@ -477,19 +457,18 @@ def run_web():
     app.run(host="0.0.0.0", port=port)
 
 def keep_alive():
-    t = Thread(target=run_web)
-    t.daemon = True
+    t = Thread(target=run_web, daemon=True)
     t.start()
 
-
+# ===== Discord events =====
 @client.event
 async def on_ready():
     global _bot_ready_time
-    print(f"✅ บอทออนไลน์แล้ว: {client.user}", flush=True)
-    print(f"🕐 เวลาไทยตอนนี้: {now_th().strftime('%d/%m/%Y %H:%M:%S')} น.", flush=True)
+    print(f"✅ บอทออนไลน์: {client.user}", flush=True)
+    print(f"🕐 {now_th().strftime('%d/%m/%Y %H:%M:%S')} น.", flush=True)
     if _redis:
         _redis.set("sai:active_instance", INSTANCE_ID, ex=3600)
-        print(f"[HANDOFF] ส่ง signal ให้ instance เก่าออก", flush=True)
+        print("[HANDOFF] ส่ง signal ให้ instance เก่าออก", flush=True)
     print(f"⏳ รอ {STARTUP_IGNORE_SEC}s...", flush=True)
     await asyncio.sleep(STARTUP_IGNORE_SEC)
     _bot_ready_time = time.time()
@@ -504,14 +483,11 @@ async def on_message(message):
         return
     if _bot_ready_time == 0.0:
         return
-
-    msg_ts = message.created_at.timestamp()
-    if msg_ts < _bot_ready_time - STARTUP_IGNORE_SEC:
+    if message.created_at.timestamp() < _bot_ready_time - STARTUP_IGNORE_SEC:
         return
 
-    is_dm = isinstance(message.channel, discord.DMChannel)
+    is_dm      = isinstance(message.channel, discord.DMChannel)
     in_allowed = message.channel.id in ALLOWED_CHANNELS
-
     if not is_dm and not in_allowed:
         return
 
@@ -519,6 +495,7 @@ async def on_message(message):
         print(f"[SKIP] message {message.id} ซ้ำ → skip", flush=True)
         return
 
+    # ===== Owner commands =====
     if message.author.id == OWNER_ID:
         if message.content == "!reset":
             user_histories.pop(message.author.id, None)
@@ -529,21 +506,26 @@ async def on_message(message):
                 target_id = int(message.content.split()[1])
                 user_histories.pop(target_id, None)
                 await message.reply(f"🔄 รีเซตแชทของ <@{target_id}> แล้วค่ะปะป๋า!")
-            except:
+            except Exception:
                 await message.reply("❌ ใช้แบบนี้นะคะ: `!resetuser <user_id>`")
             return
         if message.content == "!ping":
             await message.reply("🏓 Pong!")
             return
+        if message.content == "!testkeys":
+            async with message.channel.typing():
+                result = await test_key()
+            await message.reply(f"🔑 **ผลทดสอบ API Key**\n{result}")
+            return
         if message.content == "!stats":
             total_tokens = stats["total_tokens_in"] + stats["total_tokens_out"]
             _now = now_th()
-            next_reset = _now.replace(hour=7, minute=0, second=0, microsecond=0)
-            if _now >= next_reset:
-                next_reset += datetime.timedelta(days=1)
-            time_to_reset = next_reset - _now
-            reset_h, reset_rem = divmod(int(time_to_reset.total_seconds()), 3600)
-            reset_m = reset_rem // 60
+            nr = _now.replace(hour=7, minute=0, second=0, microsecond=0)
+            if _now >= nr:
+                nr += datetime.timedelta(days=1)
+            ttr = nr - _now
+            rh, rrem = divmod(int(ttr.total_seconds()), 3600)
+            rm = rrem // 60
             await message.reply(
                 f"📊 **Stats**\n"
                 f"• Req: `{stats['total_requests']}`\n"
@@ -551,9 +533,10 @@ async def on_message(message):
                 f"• Sessions: `{len(user_histories)}` users\n"
                 f"• Redis: `{'✅' if _redis else '⚠️ in-memory'}`\n"
                 f"• เวลาไทย: `{now_th().strftime('%d/%m/%Y %H:%M')} น.`\n"
-                f"• รีเซตถัดไป: `{next_reset.strftime('%d/%m/%Y %H:%M')} น.` (อีก {reset_h}h {reset_m}m)"
+                f"• รีเซตถัดไป: `{nr.strftime('%d/%m/%Y %H:%M')} น.` (อีก {rh}h {rm}m)"
             )
             return
+    # ==========================
 
     user_input = message.content.strip()
     if not user_input and not message.attachments:
