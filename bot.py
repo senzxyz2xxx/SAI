@@ -47,7 +47,6 @@ SYSTEM_PROMPT = """
 - ใส่อารมณ์เต็มที่ เช่น "อุ๊ย!", "ว้าวว!", "ฮ่าๆๆ", "เอ๊ะ?", "อ่าาาา", "ป๊าก!"
 - คุยธรรมชาติเหมือนเพื่อนสนิท ไม่ formal ไม่เป็นทางการ
 - ถ้าทักมาแค่ "ว่าไง" หรือ "สวัสดี" ให้ตอบทักกลับสั้นๆ สนุกๆ ก่อน ไม่ต้องถามว่า "มีอะไรให้ช่วยมั้ย" ทุกครั้ง
-- ห้ามตอบ 2 ข้อความ ตอบครั้งเดียวต่อ 1 ข้อความเสมอ
 
 ─── ความสัมพันธ์ ───
 - <@1005357318281641994> คือปะป๋า ผู้สร้างของไซ รักปะป๋ามาก ตามใจปะป๋าทุกอย่าง ชอบแซวปะป๋า
@@ -81,6 +80,7 @@ user_histories = {}
 exhausted_keys = set()
 invalid_keys = set()
 processing_users = set()
+processed_messages = set()   # กันตอบซ้ำ message เดิม
 react_cooldown = {}
 REACT_COOLDOWN_SEC = 10
 
@@ -215,7 +215,6 @@ async def _keep_typing(channel):
 
 
 async def process_message(message, user_input):
-    # บัค: ป้องกันตอบซ้ำถ้า user เดิมกำลัง process อยู่
     if message.author.id in processing_users:
         print(f"[SKIP] user {message.author.id} กำลัง process อยู่ → skip", flush=True)
         return
@@ -255,7 +254,6 @@ async def process_message(message, user_input):
                 stats["total_tokens_in"] += count_tokens(user_input or "")
                 stats["total_tokens_out"] += count_tokens(reply)
 
-                # บัค: ตัดข้อความที่ยาวเกิน 2000 ตัวอักษร (discord limit)
                 await message.reply(reply[:1950] + "..." if len(reply) > 2000 else reply)
                 return
 
@@ -287,7 +285,6 @@ async def process_message(message, user_input):
 
                 break
 
-        # บัค: ถ้าส่งไม่สำเร็จ เอา user message ออกจาก history ไม่งั้นประวัติจะพัง
         if history and history[-1]["role"] == "user":
             history.pop()
 
@@ -361,6 +358,7 @@ async def reset_daily_stats():
         user_histories.clear()
         exhausted_keys.clear()
         processing_users.clear()
+        processed_messages.clear()
         print(f"[RESET] ✅ รีเซตแล้ว! ({stats['last_reset'].strftime('%d/%m/%Y %H:%M')} น.)", flush=True)
 
 
@@ -520,14 +518,21 @@ async def on_message(message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     in_allowed = message.channel.id in ALLOWED_CHANNELS
 
-    # บัค: auto_react และ process_message แยก task กัน ไม่ให้ block กัน
     if not is_dm and in_allowed and message.content.strip():
         asyncio.create_task(auto_react(message))
 
     if not is_dm and not in_allowed:
         return
 
-    # คำสั่ง owner เท่านั้น
+    # ===== กันตอบซ้ำ message เดิม (แก้บัคตอบ 2 อัน) =====
+    if message.id in processed_messages:
+        print(f"[SKIP] message {message.id} ถูก process แล้ว → skip", flush=True)
+        return
+    processed_messages.add(message.id)
+    if len(processed_messages) > 1000:
+        processed_messages.clear()
+    # =====================================================
+
     if message.author.id == OWNER_ID:
         if message.content == "!reset":
             user_histories.pop(message.author.id, None)
@@ -563,7 +568,6 @@ async def on_message(message):
             )
             return
 
-    # คำสั่งทั่วไป
     if message.content == "!reset":
         user_histories.pop(message.author.id, None)
         await message.reply("🔄 รีเซตแชทของคุณแล้วค่ะ!")
