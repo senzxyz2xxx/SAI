@@ -46,7 +46,7 @@ ALLOWED_CHANNELS = [
 MODEL_NAME = "gemini-2.5-flash-lite"
 MAX_REPLY_TOKENS = 800
 HISTORY_LIMIT_PAIRS = 20
-MAX_REPLY_LENGTH = 1800  # ถ้าเกินนี้จะสรุปแทน
+MAX_REPLY_LENGTH = 1800
 
 TZ_OFFSET = datetime.timezone(datetime.timedelta(hours=7))
 
@@ -94,6 +94,11 @@ SUMMARIZE_PROMPT = """
 """
 # ============================
 
+# ===== กัน message ซ้ำระหว่าง deploy =====
+_bot_ready_time: float = 0.0  # จะ set ตอน on_ready เสร็จ
+STARTUP_IGNORE_SEC = 30       # ละเว้น message ที่เกิดก่อน bot ready + buffer นี้
+# ==========================================
+
 def now_th():
     return datetime.datetime.now(TZ_OFFSET)
 
@@ -107,9 +112,8 @@ exhausted_keys = set()
 invalid_keys = set()
 processing_users = set()
 
-# --- dedup: map message_id → timestamp ---
 processed_messages: dict[int, float] = {}
-DEDUP_TTL = 30  # วินาที — ล้าง cache หลังจากนี้
+DEDUP_TTL = 30
 
 react_cooldown = {}
 REACT_COOLDOWN_SEC = 10
@@ -202,11 +206,9 @@ def parse_error(e: Exception) -> str:
     return f"❌ เกิด error อ่ะ: `{msg[:200]}`"
 
 
-# ===== ดึงรูปจาก Discord attachment =====
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
 async def fetch_image_bytes(url: str) -> tuple[bytes, str] | None:
-    """ดาวน์โหลดรูปจาก URL คืน (bytes, mime_type) หรือ None ถ้าล้มเหลว"""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -223,14 +225,12 @@ async def fetch_image_bytes(url: str) -> tuple[bytes, str] | None:
 
 
 def build_contents_with_images(text: str, image_parts: list) -> list:
-    """สร้าง contents list สำหรับ Gemini ที่มีทั้งรูปและข้อความ"""
     parts = []
     for img_bytes, mime_type in image_parts:
         parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime_type))
     if text:
         parts.append(types.Part.from_text(text=text))
     return [types.Content(role="user", parts=parts)]
-# =========================================
 
 
 async def auto_react(message):
@@ -276,7 +276,6 @@ async def _keep_typing(channel):
 
 
 async def summarize_if_too_long(text: str, key_index: int) -> str:
-    """ถ้าข้อความยาวเกิน MAX_REPLY_LENGTH ให้ Gemini สรุปให้"""
     if len(text) <= MAX_REPLY_LENGTH:
         return text
     print(f"[SUMMARIZE] ข้อความยาว {len(text)} ตัว → สรุป", flush=True)
@@ -310,16 +309,13 @@ async def process_message(message, user_input):
         last_error = None
         history = get_history(message.author.id)
 
-        # ===== ดึงรูปจาก attachments =====
         image_parts = []
         for attachment in message.attachments:
             result = await fetch_image_bytes(attachment.url)
             if result:
                 image_parts.append(result)
                 print(f"[IMG] โหลดรูป {attachment.filename} ({attachment.content_type})", flush=True)
-        # ==================================
 
-        # ถ้ามีรูป ให้ส่งเป็น multimodal (ไม่เก็บใน history เพราะ Gemini ไม่รองรับรูปใน turn เก่า)
         has_images = len(image_parts) > 0
 
         if not has_images:
@@ -336,7 +332,6 @@ async def process_message(message, user_input):
                 client_obj = get_client(key)
 
                 if has_images:
-                    # multimodal: ส่งรูป + ข้อความ (ไม่ใช้ history)
                     prompt_text = user_input if user_input else "ช่วยดูรูปนี้ให้หน่อยนะคะ อธิบายว่าเห็นอะไรบ้าง"
                     contents = build_contents_with_images(prompt_text, image_parts)
                     response = await asyncio.to_thread(
@@ -349,7 +344,6 @@ async def process_message(message, user_input):
                         ),
                     )
                 else:
-                    # text only: ใช้ history ปกติ
                     response = await asyncio.to_thread(
                         client_obj.models.generate_content,
                         model=MODEL_NAME,
@@ -370,9 +364,7 @@ async def process_message(message, user_input):
                 stats["total_tokens_in"] += count_tokens(user_input or "")
                 stats["total_tokens_out"] += count_tokens(reply)
 
-                # สรุปถ้ายาวเกิน
                 reply = await summarize_if_too_long(reply, key_index)
-
                 await message.reply(reply)
                 return
 
@@ -403,7 +395,6 @@ async def process_message(message, user_input):
                         continue
 
                 if "500" in err_msg or "503" in err_msg:
-                    # retry ซ้ำ key เดิมสูงสุด 3 ครั้ง ห่างกัน 5s
                     retry_success = False
                     for attempt in range(1, 4):
                         print(f"[RETRY] key {key_index + 1} server error → retry {attempt}/3 รอ 5s", flush=True)
@@ -445,7 +436,6 @@ async def process_message(message, user_input):
                             last_error = retry_e
                     if retry_success:
                         return
-                    # retry ครบแล้วยังไม่ได้ → ข้ามไป key ถัดไป
                     continue
 
                 break
@@ -500,9 +490,6 @@ async def test_all_keys() -> str:
     return "\n".join(lines)
 
 
-# =======================
-# AUTO RESET DAILY STATS
-# =======================
 async def reset_daily_stats():
     await client.wait_until_ready()
     while not client.is_closed():
@@ -527,9 +514,6 @@ async def reset_daily_stats():
         print(f"[RESET] ✅ รีเซตแล้ว! ({stats['last_reset'].strftime('%d/%m/%Y %H:%M')} น.)", flush=True)
 
 
-# =======================
-# WEB SERVER (ANTI-SLEEP)
-# =======================
 app = Flask('')
 
 @app.route('/')
@@ -642,10 +626,10 @@ def home():
         </div>
     </div>
     <div class="limits-card">
-        <div class="limits-title">✨ Gemini 2.5 Flash Free Tier (ต่อ key)</div>
+        <div class="limits-title">✨ Gemini Free Tier (ต่อ key)</div>
         <div class="limit-row"><span class="limit-label">Model</span><span class="limit-val">{MODEL_NAME}</span></div>
-        <div class="limit-row"><span class="limit-label">Requests / วัน</span><span class="limit-val">500 RPD</span></div>
-        <div class="limit-row"><span class="limit-label">Requests / นาที</span><span class="limit-val">10 RPM</span></div>
+        <div class="limit-row"><span class="limit-label">Requests / วัน</span><span class="limit-val">1,000 RPD</span></div>
+        <div class="limit-row"><span class="limit-label">Requests / นาที</span><span class="limit-val">15 RPM</span></div>
         <div class="limit-row"><span class="limit-label">Vision (อ่านรูป)</span><span class="limit-val">✅ รองรับ</span></div>
         <div class="limit-row"><span class="limit-label">API Keys ที่ใช้</span><span class="limit-val">{len(API_KEYS)} key(s)</span></div>
         <div class="limit-row"><span class="limit-label">Keys ที่ยัง active</span><span class="limit-val">{active_keys} key(s)</span></div>
@@ -671,8 +655,14 @@ def keep_alive():
 
 @client.event
 async def on_ready():
+    global _bot_ready_time
     print(f"✅ บอทออนไลน์แล้ว: {client.user} ({len(API_KEYS)} API key(s) โหลดแล้ว)", flush=True)
     print(f"🕐 เวลาไทยตอนนี้: {now_th().strftime('%d/%m/%Y %H:%M:%S')} น.", flush=True)
+    # รอให้ instance เก่า disconnect ก่อน — แก้ปัญหาตอบ 2 อัน
+    print(f"⏳ รอ {STARTUP_IGNORE_SEC}s ให้ instance เก่า disconnect...", flush=True)
+    await asyncio.sleep(STARTUP_IGNORE_SEC)
+    _bot_ready_time = time.time()
+    print("✅ พร้อมรับ message แล้ว!", flush=True)
     client.loop.create_task(reset_daily_stats())
 
 
@@ -681,12 +671,17 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # ===== กัน message เก่า (reconnect replay) =====
-    age = (datetime.datetime.now(datetime.timezone.utc) - message.created_at).total_seconds()
-    if age > 10:
-        print(f"[SKIP] message เก่า {age:.1f}s → skip", flush=True)
+    # ===== รอจน on_ready sleep เสร็จก่อน =====
+    if _bot_ready_time == 0.0:
+        return  # ยังอยู่ระหว่าง startup sleep
+    # ===========================================
+
+    # ===== กัน message ที่เกิดก่อน bot ready (ของ instance เก่า) =====
+    msg_ts = message.created_at.timestamp()
+    if msg_ts < _bot_ready_time - STARTUP_IGNORE_SEC:
+        print(f"[SKIP] message เก่าก่อน startup → skip", flush=True)
         return
-    # ================================================
+    # =================================================================
 
     is_dm = isinstance(message.channel, discord.DMChannel)
     in_allowed = message.channel.id in ALLOWED_CHANNELS
@@ -697,7 +692,7 @@ async def on_message(message):
     if not is_dm and not in_allowed:
         return
 
-    # ===== กันตอบซ้ำ message เดิม (dedup ด้วย timestamp) =====
+    # ===== dedup =====
     now_ts = time.time()
     expired = [k for k, v in processed_messages.items() if now_ts - v > DEDUP_TTL]
     for k in expired:
@@ -707,7 +702,7 @@ async def on_message(message):
         print(f"[SKIP] message {message.id} ซ้ำ → skip", flush=True)
         return
     processed_messages[message.id] = now_ts
-    # ==========================================================
+    # =================
 
     if message.author.id == OWNER_ID:
         if message.content == "!reset":
@@ -762,7 +757,6 @@ async def on_message(message):
 
     user_input = message.content.strip()
 
-    # ถ้าไม่มีทั้ง text และรูป → skip
     if not user_input and not message.attachments:
         return
 
