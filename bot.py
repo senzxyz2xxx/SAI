@@ -43,7 +43,7 @@ ALLOWED_CHANNELS = [
     1520009829924474973,
 ]
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3-flash"
 MAX_REPLY_TOKENS = 800
 HISTORY_LIMIT_PAIRS = 20
 MAX_REPLY_LENGTH = 1800  # ถ้าเกินนี้จะสรุปแทน
