@@ -46,6 +46,9 @@ HISTORY_LIMIT_PAIRS = 20
 MAX_REPLY_LENGTH   = 1800
 TZ_OFFSET          = datetime.timezone(datetime.timedelta(hours=7))
 
+# จำกัดความยาวรวมของ history (ตัวอักษร) ก่อนส่งเข้าโมเดล กันชน TPM
+MAX_HISTORY_CHARS  = 12000
+
 SYSTEM_PROMPT = """
 คุณคือ SAI (ไซ) บอท AI ประจำเซิร์ฟเวอร์ Discord
 ไซเป็นเด็กผู้หญิงตัวเล็กๆ น่ารัก ช่างพูด ซน อารมณ์ดี ชอบแสดงความรู้สึก
@@ -112,8 +115,9 @@ def check_and_mark(msg_id: int) -> bool:
 # =================
 
 # ===== Rate Limit =====
-# เก็บประวัติการใช้งาน 15 รายการล่าสุดในหน่วยความจำ
-request_history = deque(maxlen=15)
+# เก็บประวัติการใช้งานล่าสุดในหน่วยความจำ
+# ลดจาก 15 → 12 เพื่อ "ตัดหน้า" ก่อนที่กูเกิลจะล็อกจริงที่ 15 RPM
+request_history = deque(maxlen=12)
 
 async def check_rate_limit(message):
     now = time.time()
@@ -121,8 +125,8 @@ async def check_rate_limit(message):
     while request_history and request_history[0] < now - 60:
         request_history.popleft()
 
-    # ถ้าครบ 15 ครั้งใน 60 วินาที
-    if len(request_history) >= 15:
+    # ถ้าครบจำนวนที่กำหนดใน 60 วินาที
+    if len(request_history) >= request_history.maxlen:
         await message.reply("⏳ ไซขอพักหายใจแป๊บนะคะ! ปะป๋ารัวเร็วเกินไปแล้ววว~ (รออีกนิดนะคะ)")
         return False
 
@@ -167,21 +171,45 @@ def get_reset_time_str() -> str:
         next_reset += datetime.timedelta(days=1)
     return next_reset.strftime("%d/%m/%Y %H:%M")
 
+# ===== Error classification (FIXED) =====
+# เดิม: เช็คแค่ "429" in msg แล้วปัดเป็น daily quota ทันที
+#       → ปัญหาคือ RPM (รายนาที) กับ RPD (รายวัน) ของ Gemini free tier
+#         ทั้งคู่ตอบกลับเป็น "429 RESOURCE_EXHAUSTED" เหมือนกัน
+#         ทำให้โดน rate-limit รายนาทีก็เข้าใจผิดว่าโควตาวันหมด แล้วไป sleep ถึง 07:00
+#
+# ใหม่: เช็คคำที่บ่งชี้ "นาที" ก่อนเป็นอันดับแรก (exclude) แล้วค่อยเช็คคำที่บ่งชี้ "วัน"
+#       ถ้าไม่มีสัญญาณวันชัดเจน ให้ fallback ไปทาง "รอแป๊บ" (rate limit) แทนที่จะเดาว่าหมดทั้งวัน
+#       เพราะการเดาผิดแบบ false-rate-limit (รอ 1 นาทีฟรีๆ) เสียหายน้อยกว่า
+#       false-daily-quota (บอทหลับยาวทั้งที่ยังใช้ได้)
+
 def is_daily_quota_error(msg: str) -> bool:
     """quota วันหมด (ไม่ใช่ rate limit ต่อนาที)"""
     lower = msg.lower()
+
+    # ถ้ามีสัญญาณว่าเป็นรายนาทีชัดเจน → ไม่ใช่ daily แน่นอน
+    if "per_minute" in lower or "per minute" in lower or "requests per minute" in lower or "perminute" in lower:
+        return False
+
     return (
-        "resource_exhausted" in lower
-        or "per_day" in lower
+        "per_day" in lower
+        or "requests per day" in lower
         or "daily" in lower
         or "quota exceeded" in lower
-        or ("429" in msg and "per_minute" not in lower and "perminute" not in lower)
     )
 
 def is_rate_limit_error(msg: str) -> bool:
-    """rate limit ต่อนาที (ชั่วคราว)"""
+    """rate limit ต่อนาที (ชั่วคราว) — เป็น default fallback ของ 429 ที่ไม่ใช่ daily"""
     lower = msg.lower()
-    return "429" in msg and ("per_minute" in lower or "perminute" in lower)
+
+    # ถ้าเป็น daily ชัดเจนอยู่แล้ว ไม่ใช่ rate limit รายนาที
+    if "per_day" in lower or "requests per day" in lower or "daily" in lower or "quota exceeded" in lower:
+        return False
+
+    if "429" not in msg:
+        return False
+
+    return True
+# ============================
 
 user_histories   = {}
 processing_users = set()
@@ -205,9 +233,22 @@ def get_history(user_id: int) -> list:
     return user_histories[user_id]
 
 def trim_history(history: list):
+    # ตัดตามจำนวนคู่ข้อความ
     max_messages = HISTORY_LIMIT_PAIRS * 2
     if len(history) > max_messages:
         del history[: len(history) - max_messages]
+
+    # ตัดเพิ่มตามความยาวตัวอักษรรวม กัน context ยาวจนชน TPM (Tokens Per Minute)
+    def total_chars(h):
+        total = 0
+        for m in h:
+            for p in m.get("parts", []):
+                total += len(p.get("text", ""))
+        return total
+
+    while history and total_chars(history) > MAX_HISTORY_CHARS:
+        # ตัดออกทีละคู่ (user+model) จากด้านหน้าสุด
+        del history[0]
 
 def count_tokens(text: str) -> int:
     return len(text) // 4
@@ -314,14 +355,24 @@ async def process_message(message, user_input):
             await message.reply(reply)
         except Exception as e:
             err_msg = str(e)
+            # LOG: error ดิบเต็มๆ (ไม่ตัด) เพื่อเอาไว้ตรวจสอบ keyword จริงจาก Google
+            # ถ้าพบว่า format เปลี่ยนไปจากที่เช็คไว้ ให้เอา log บรรทัดนี้มาปรับ
+            # is_daily_quota_error / is_rate_limit_error ต่อได้
+            print(f"[ERROR RAW] {err_msg}", flush=True)
             print(f"[ERROR] {err_msg[:300]}", flush=True)
             if not has_images and history and history[-1]["role"] == "user":
                 history.pop()
-            if is_daily_quota_error(err_msg):
+
+            is_daily = is_daily_quota_error(err_msg)
+            is_rpm   = is_rate_limit_error(err_msg)
+            # LOG: ผลการจำแนกประเภท error เพื่อ debug ว่าเข้า branch ไหน
+            print(f"[ERROR CLASSIFY] daily_quota={is_daily} rate_limit={is_rpm}", flush=True)
+
+            if is_daily:
                 reset_str = get_reset_time_str()
                 await update_bot_status("resting")
                 await message.reply(f"ว้ายยย! ไซขอพักก่อนนะคะ เหนื่อยมากเลยย~ 💤\nเดี๋ยวไซตื่นใหม่ตอน **{reset_str} น.** แล้วเจอกันนะคะ!")
-            elif is_rate_limit_error(err_msg):
+            elif is_rpm:
                 await message.reply("⏳ เยอะไปนิดนึงค่ะ รอแป๊บแล้วลองใหม่นะคะ~")
             elif "400" in err_msg:
                 await message.reply("เอ๊ะ? ข้อความนี้ไซรับไม่ได้อ่ะค่ะ ลองใหม่ด้วยข้อความอื่นได้เลยนะคะ 🙏")
@@ -348,6 +399,7 @@ async def test_key() -> str:
         return "✅ ใช้งานได้ปกติค่ะ"
     except Exception as e:
         err = str(e)
+        print(f"[TESTKEY ERROR RAW] {err}", flush=True)
         if is_daily_quota_error(err):
             return f"⚠️ quota วันนี้หมดแล้วค่ะ: `{err[:150]}`"
         if is_rate_limit_error(err):
@@ -477,7 +529,7 @@ def home():
         <div class="limits-title">✨ Gemini Free Tier</div>
         <div class="limit-row"><span class="limit-label">Model</span><span class="limit-val">{MODEL_NAME}</span></div>
         <div class="limit-row"><span class="limit-label">Requests / วัน</span><span class="limit-val">1,500 RPD</span></div>
-        <div class="limit-row"><span class="limit-label">Requests / นาที</span><span class="limit-val">15 RPM</span></div>
+        <div class="limit-row"><span class="limit-label">Requests / นาที</span><span class="limit-val">12 RPM (ตัดหน้า) / 15 RPM (กูเกิล)</span></div>
         <div class="limit-row"><span class="limit-label">Vision (อ่านรูป)</span><span class="limit-val">✅ รองรับ</span></div>
         <div class="limit-row"><span class="limit-label">รีเซต stats อัตโนมัติ</span><span class="limit-val reset-badge">ทุกวัน 07:00 น. (UTC+7)</span></div>
     </div>
