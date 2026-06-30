@@ -40,11 +40,11 @@ ALLOWED_CHANNELS = [
     1520009829924474973,
 ]
 
-MODEL_NAME         = "gemini-2.0-flash"
-MAX_REPLY_TOKENS   = 800
+MODEL_NAME          = "gemini-2.0-flash"
+MAX_REPLY_TOKENS    = 800
 HISTORY_LIMIT_PAIRS = 20
-MAX_REPLY_LENGTH   = 1800
-TZ_OFFSET          = datetime.timezone(datetime.timedelta(hours=7))
+MAX_REPLY_LENGTH    = 1800
+TZ_OFFSET           = datetime.timezone(datetime.timedelta(hours=7))
 
 # จำกัดความยาวรวมของ history (ตัวอักษร) ก่อนส่งเข้าโมเดล กันชน TPM
 MAX_HISTORY_CHARS  = 12000
@@ -115,17 +115,13 @@ def check_and_mark(msg_id: int) -> bool:
 # =================
 
 # ===== Rate Limit =====
-# เก็บประวัติการใช้งานล่าสุดในหน่วยความจำ
-# ลดจาก 15 → 12 เพื่อ "ตัดหน้า" ก่อนที่กูเกิลจะล็อกจริงที่ 15 RPM
 request_history = deque(maxlen=12)
 
 async def check_rate_limit(message):
     now = time.time()
-    # ลบข้อมูลที่เก่าเกิน 60 วินาทีทิ้งไป
     while request_history and request_history[0] < now - 60:
         request_history.popleft()
 
-    # ถ้าครบจำนวนที่กำหนดใน 60 วินาที
     if len(request_history) >= request_history.maxlen:
         await message.reply("⏳ ไซขอพักหายใจแป๊บนะคะ! ปะป๋ารัวเร็วเกินไปแล้ววว~ (รออีกนิดนะคะ)")
         return False
@@ -138,9 +134,9 @@ async def check_rate_limit(message):
 INSTANCE_ID      = str(time.time())
 _bot_ready_time  : float = 0.0
 STARTUP_IGNORE_SEC = 5
+_tasks_started     = False  # Flag ป้องกัน Task รันซ้ำซ้อนตอน Reconnect
 
 async def _watch_instance_signal():
-    """รอให้ _bot_ready_time set ก่อน แล้วค่อย watch"""
     while _bot_ready_time == 0.0:
         await asyncio.sleep(1)
     while True:
@@ -171,44 +167,36 @@ def get_reset_time_str() -> str:
         next_reset += datetime.timedelta(days=1)
     return next_reset.strftime("%d/%m/%Y %H:%M")
 
-# ===== Error classification (FIXED) =====
-# เดิม: เช็คแค่ "429" in msg แล้วปัดเป็น daily quota ทันที
-#       → ปัญหาคือ RPM (รายนาที) กับ RPD (รายวัน) ของ Gemini free tier
-#         ทั้งคู่ตอบกลับเป็น "429 RESOURCE_EXHAUSTED" เหมือนกัน
-#         ทำให้โดน rate-limit รายนาทีก็เข้าใจผิดว่าโควตาวันหมด แล้วไป sleep ถึง 07:00
-#
-# ใหม่: เช็คคำที่บ่งชี้ "นาที" ก่อนเป็นอันดับแรก (exclude) แล้วค่อยเช็คคำที่บ่งชี้ "วัน"
-#       ถ้าไม่มีสัญญาณวันชัดเจน ให้ fallback ไปทาง "รอแป๊บ" (rate limit) แทนที่จะเดาว่าหมดทั้งวัน
-#       เพราะการเดาผิดแบบ false-rate-limit (รอ 1 นาทีฟรีๆ) เสียหายน้อยกว่า
-#       false-daily-quota (บอทหลับยาวทั้งที่ยังใช้ได้)
-
+# ===== Error classification (FIXED 100%) =====
 def is_daily_quota_error(msg: str) -> bool:
-    """quota วันหมด (ไม่ใช่ rate limit ต่อนาที)"""
+    """quota วันหมดจริงๆ (จะไม่มีคำว่า please retry in สั้นๆ เป็นวินาที)"""
     lower = msg.lower()
 
-    # ถ้ามีสัญญาณว่าเป็นรายนาทีชัดเจน → ไม่ใช่ daily แน่นอน
-    if "per_minute" in lower or "per minute" in lower or "requests per minute" in lower or "perminute" in lower:
+    # ถ้าแจ้งให้ retry โดยระบุเวลาเด่นชัด แสดงว่าเป็นเพียง Rate limit รายนาที
+    if "please retry in" in lower and any(x in lower for x in ["s", "ms", "sec", "min", "秒"]):
         return False
 
     return (
-        "per_day" in lower
-        or "requests per day" in lower
+        ("generate_content_free_tier_requests" in lower and "limit: 0" in lower)
+        or "per_day" in lower
+        or "requestsperday" in lower
         or "daily" in lower
         or "quota exceeded" in lower
     )
 
 def is_rate_limit_error(msg: str) -> bool:
-    """rate limit ต่อนาที (ชั่วคราว) — เป็น default fallback ของ 429 ที่ไม่ใช่ daily"""
+    """rate limit ต่อนาที หรือ Token ต่อนาทีเต็มชั่วคราว (มีเวลานับถอยหลังให้รอ)"""
     lower = msg.lower()
 
-    # ถ้าเป็น daily ชัดเจนอยู่แล้ว ไม่ใช่ rate limit รายนาที
-    if "per_day" in lower or "requests per day" in lower or "daily" in lower or "quota exceeded" in lower:
-        return False
+    if "please retry in" in lower:
+        return True
 
-    if "429" not in msg:
-        return False
-
-    return True
+    return (
+        "per_minute" in lower
+        or "perminute" in lower
+        or "input_token_count" in lower
+        or "429" in lower
+    )
 # ============================
 
 user_histories   = {}
@@ -233,12 +221,10 @@ def get_history(user_id: int) -> list:
     return user_histories[user_id]
 
 def trim_history(history: list):
-    # ตัดตามจำนวนคู่ข้อความ
     max_messages = HISTORY_LIMIT_PAIRS * 2
     if len(history) > max_messages:
         del history[: len(history) - max_messages]
 
-    # ตัดเพิ่มตามความยาวตัวอักษรรวม กัน context ยาวจนชน TPM (Tokens Per Minute)
     def total_chars(h):
         total = 0
         for m in h:
@@ -247,11 +233,11 @@ def trim_history(history: list):
         return total
 
     while history and total_chars(history) > MAX_HISTORY_CHARS:
-        # ตัดออกทีละคู่ (user+model) จากด้านหน้าสุด
         del history[0]
 
 def count_tokens(text: str) -> int:
-    return len(text) // 4
+    # ภาษาไทยกิน token เยอะกว่าอังกฤษ (~2-3 เท่า) ในระบบ tokenizer ของ Gemini
+    return int(len(text) * 0.7) if any(ord(char) > 127 for char in text) else len(text) // 4
 
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
@@ -355,9 +341,6 @@ async def process_message(message, user_input):
             await message.reply(reply)
         except Exception as e:
             err_msg = str(e)
-            # LOG: error ดิบเต็มๆ (ไม่ตัด) เพื่อเอาไว้ตรวจสอบ keyword จริงจาก Google
-            # ถ้าพบว่า format เปลี่ยนไปจากที่เช็คไว้ ให้เอา log บรรทัดนี้มาปรับ
-            # is_daily_quota_error / is_rate_limit_error ต่อได้
             print(f"[ERROR RAW] {err_msg}", flush=True)
             print(f"[ERROR] {err_msg[:300]}", flush=True)
             if not has_images and history and history[-1]["role"] == "user":
@@ -365,26 +348,24 @@ async def process_message(message, user_input):
 
             is_daily = is_daily_quota_error(err_msg)
             is_rpm   = is_rate_limit_error(err_msg)
-            # LOG: ผลการจำแนกประเภท error เพื่อ debug ว่าเข้า branch ไหน
             print(f"[ERROR CLASSIFY] daily_quota={is_daily} rate_limit={is_rpm}", flush=True)
 
             if is_daily:
                 reset_str = get_reset_time_str()
                 await update_bot_status("resting")
-                await message.reply(f"ว้ายยย! ไซขอพักก่อนนะคะ เหนื่อยมากเลยย~ 💤\nเดี๋ยวไซตื่นใหม่ตอน **{reset_str} น.** แล้วเจอกันนะคะ!")
+                await message.reply(f"ว้ายยย! โควตารายวันของไซหมดเกลี้ยงแล้วค่ะปะป๋า 💤\nเดี๋ยวไซตื่นใหม่ตอน **{reset_str} น.** นะคะ!")
             elif is_rpm:
-                await message.reply("⏳ เยอะไปนิดนึงค่ะ รอแป๊บแล้วลองใหม่นะคะ~")
+                await message.reply("⏳ อูยยย ปะป๋าหรือเพื่อนๆ รัวข้อความ/รูปภาพไวเกินไปจนไซประมวลผลไม่ทันแล้วค่ะ! ขอเวลาหายใจสัก 10-60 วินาทีแล้วลองใหม่นะคะ~ 🥺")
             elif "400" in err_msg:
-                await message.reply("เอ๊ะ? ข้อความนี้ไซรับไม่ได้อ่ะค่ะ ลองใหม่ด้วยข้อความอื่นได้เลยนะคะ 🙏")
+                await message.reply("เอ๊ะ? ข้อความนี้ไซรับไม่ได้อ่ะค่ะ ลองเปลี่ยนคำพูดดูใหม่นะคะ 🙏")
             elif "500" in err_msg or "503" in err_msg or "unavailable" in err_msg.lower():
-                await message.reply("ว้าย! ตอนนี้โมเดลคนใช้เยอะจนระบบเอ๋อ (503) ค่ะ รอแป๊บนึงแล้วลองใหม่นะคะ 🛠️")
+                await message.reply("ว้าย! ตอนนี้ฝั่งกูเกิลคนใช้เยอะจนระบบเอ๋อ (503) ค่ะ รอแป๊บนึงแล้วลองใหม่นะคะ 🛠️")
             else:
-                await message.reply("อุ๊ย! เกิด error นิดนึงค่ะ ลองใหม่ได้เลยนะคะ~")
+                await message.reply("อุ๊ย! เกิด error แปลกๆ นิดนึงค่ะ ลองใหม่อีกทีนะคะปะป๋า~")
     finally:
         typing_task.cancel()
         processing_users.discard(message.author.id)
         processing_messages.discard(message.id)
-        # คืนสถานะเป็น ready ถ้าไม่มีงานค้าง
         if not processing_users:
             await update_bot_status("ready")
 
@@ -447,7 +428,7 @@ def home():
     uptime = now_th() - stats["start_time"]
     h, rem = divmod(int(uptime.total_seconds()), 3600)
     m, s   = divmod(rem, 60)
-    current_th   = now_th().strftime("%d/%m/%Y %H:%M:%S")
+    current_th    = now_th().strftime("%d/%m/%Y %H:%M:%S")
     last_reset_th = stats["last_reset"].strftime("%d/%m/%Y %H:%M")
     _now = now_th()
     next_reset = _now.replace(hour=7, minute=0, second=0, microsecond=0)
@@ -550,7 +531,7 @@ def keep_alive():
 # ===== Discord events =====
 @client.event
 async def on_ready():
-    global _bot_ready_time
+    global _bot_ready_time, _tasks_started
     print(f"✅ บอทออนไลน์: {client.user}", flush=True)
     print(f"🕐 {now_th().strftime('%d/%m/%Y %H:%M:%S')} น.", flush=True)
     if _redis:
@@ -561,8 +542,12 @@ async def on_ready():
     _bot_ready_time = time.time()
     print("✅ พร้อมรับ message แล้ว!", flush=True)
     await update_bot_status("ready")
-    client.loop.create_task(reset_daily_stats())
-    client.loop.create_task(_watch_instance_signal())
+    
+    # รันลูปเบื้องหลังเฉพาะตอนเปิดบอทครั้งแรกเท่านั้น (กันทำงานซ้ำตอนเน็ตหลุด/Reconnect)
+    if not _tasks_started:
+        client.loop.create_task(reset_daily_stats())
+        client.loop.create_task(_watch_instance_signal())
+        _tasks_started = True
 
 
 @client.event
