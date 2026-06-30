@@ -1,8 +1,7 @@
 import discord
-from google import genai
-from google.genai import types
 import os
 import sys
+import json
 import datetime
 import time
 import asyncio
@@ -30,9 +29,15 @@ except BlockingIOError:
 # =========================
 
 # ========== CONFIG ==========
-DISCORD_TOKEN   = os.getenv("DISCORD_TOKEN")
-OWNER_ID        = 1005357318281641994
-GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
+DISCORD_TOKEN      = os.getenv("DISCORD_TOKEN")
+OWNER_ID           = 1005357318281641994
+
+# ===== OpenRouter (เปลี่ยนจาก Gemini) =====
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
+# Header แนะนำของ OpenRouter (ใช้สำหรับ ranking/analytics ฝั่งเขา ไม่บังคับแต่ใส่ไว้ดีกว่า)
+OPENROUTER_SITE_URL  = os.getenv("OPENROUTER_SITE_URL", "https://discord.com")
+OPENROUTER_APP_NAME  = os.getenv("OPENROUTER_APP_NAME", "SAI Discord Bot")
 
 ALLOWED_CHANNELS = [
     1518970044925739160,
@@ -40,14 +45,17 @@ ALLOWED_CHANNELS = [
     1520009829924474973,
 ]
 
-MODEL_NAME          = "gemini-2.0-flash"
+MODEL_NAME          = "meta-llama/llama-3.3-70b-instruct:free"
 MAX_REPLY_TOKENS    = 800
 HISTORY_LIMIT_PAIRS = 20
 MAX_REPLY_LENGTH    = 1800
 TZ_OFFSET           = datetime.timezone(datetime.timedelta(hours=7))
 
-# จำกัดความยาวรวมของ history (ตัวอักษร) ก่อนส่งเข้าโมเดล กันชน TPM
+# จำกัดความยาวรวมของ history (ตัวอักษร) ก่อนส่งเข้าโมเดล กันชน context/TPM
 MAX_HISTORY_CHARS  = 12000
+
+# โมเดลนี้เป็น text-only ไม่รองรับการดูรูปภาพ (ต่างจาก Gemini เดิมที่มี vision)
+SUPPORTS_VISION = False
 
 SYSTEM_PROMPT = """
 คุณคือ SAI (ไซ) บอท AI ประจำเซิร์ฟเวอร์ Discord
@@ -69,8 +77,8 @@ SYSTEM_PROMPT = """
 ─── ความสามารถ ───
 - คุยทั่วไป, เกม, หนัง, เพลง, อนิเมะ, ให้คำปรึกษา
 - แปลภาษา, ช่วยเขียน, สรุปข้อมูล
-- ดูรูปภาพและอธิบายสิ่งที่เห็นได้
 - คุยได้ทุกเรื่อง ตามใจคนคุยได้เลย
+- (หมายเหตุ: ตอนนี้ไซยังดูรูปภาพไม่ได้นะคะ ถ้ามีคนส่งรูปมาให้บอกน่ารักๆ ว่ายังดูรูปไม่ได้)
 """
 
 SUMMARIZE_PROMPT = """
@@ -115,7 +123,10 @@ def check_and_mark(msg_id: int) -> bool:
 # =================
 
 # ===== Rate Limit =====
-request_history = deque(maxlen=12)
+# OpenRouter free models (":free") จำกัดอยู่ที่ประมาณ 20 req/นาที และ 50 req/วัน
+# (ถ้าไม่เคยเติมเครดิตเลย) หรือ 1000 req/วันถ้าเติมเครดิตขั้นต่ำแล้ว
+# ตั้งไว้ที่ 10 ต่อนาทีเพื่อตัดหน้าก่อนโดน 429 จริงจากฝั่ง OpenRouter
+request_history = deque(maxlen=10)
 
 async def check_rate_limit(message):
     now = time.time()
@@ -155,11 +166,6 @@ async def _watch_instance_signal():
 def now_th():
     return datetime.datetime.now(TZ_OFFSET)
 
-_genai_client = genai.Client(api_key=GEMINI_API_KEY)
-
-def get_genai_client():
-    return _genai_client
-
 def get_reset_time_str() -> str:
     now = now_th()
     next_reset = now.replace(hour=7, minute=0, second=0, microsecond=0)
@@ -167,35 +173,89 @@ def get_reset_time_str() -> str:
         next_reset += datetime.timedelta(days=1)
     return next_reset.strftime("%d/%m/%Y %H:%M")
 
-# ===== Error classification (FIXED 100%) =====
+# ===== OpenRouter API call =====
+class OpenRouterError(Exception):
+    """Error จาก OpenRouter พร้อมเก็บ status code และ raw body ไว้ debug"""
+    def __init__(self, status: int, body: str):
+        self.status = status
+        self.body = body
+        super().__init__(f"OpenRouter {status}: {body}")
+
+async def call_openrouter(messages: list, max_tokens: int = MAX_REPLY_TOKENS, model: str = MODEL_NAME) -> str:
+    """
+    เรียก OpenRouter chat/completions แบบ async ด้วย aiohttp
+    messages: list ของ {"role": "system"|"user"|"assistant", "content": "..."}
+    คืนค่าเป็นข้อความตอบกลับ (string) หรือ raise OpenRouterError ถ้า error
+    """
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": OPENROUTER_SITE_URL,
+        "X-Title": OPENROUTER_APP_NAME,
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            OPENROUTER_URL,
+            headers=headers,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            body_text = await resp.text()
+            if resp.status != 200:
+                raise OpenRouterError(resp.status, body_text)
+            try:
+                data = json.loads(body_text)
+            except Exception:
+                raise OpenRouterError(resp.status, f"invalid json: {body_text[:300]}")
+
+            # OpenRouter บางครั้งคืน 200 แต่มี error object ฝังอยู่ข้างใน
+            if "error" in data:
+                raise OpenRouterError(200, json.dumps(data["error"], ensure_ascii=False))
+
+            try:
+                return data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError):
+                raise OpenRouterError(resp.status, f"unexpected response shape: {body_text[:300]}")
+# ============================
+
+# ===== Error classification (สำหรับ OpenRouter) =====
+# OpenRouter ไม่มี daily/per-minute แยกชัดแบบ Gemini แต่ error message ของโมเดล free
+# มักมีคำว่า "rate-limited", "rate limit", หรือ retry-after มาด้วย ส่วน daily/credit
+# หมดมักมีคำว่า "credits", "quota", "exceeded your" หรือ status 402 (payment required)
+
 def is_daily_quota_error(msg: str) -> bool:
-    """quota วันหมดจริงๆ (จะไม่มีคำว่า please retry in สั้นๆ เป็นวินาที)"""
+    """เครดิต/โควตาหมดแบบที่ต้องรอข้ามวัน หรือต้องเติมเครดิต"""
     lower = msg.lower()
 
-    # ถ้าแจ้งให้ retry โดยระบุเวลาเด่นชัด แสดงว่าเป็นเพียง Rate limit รายนาที
-    if "please retry in" in lower and any(x in lower for x in ["s", "ms", "sec", "min", "秒"]):
+    # ถ้ามี retry-after เป็นวินาที/นาทีสั้นๆ ชัดเจน ไม่ใช่ daily แน่นอน
+    if ("retry" in lower or "please try again" in lower) and any(
+        x in lower for x in ["second", "sec", "ms", " min", "minute"]
+    ):
         return False
 
     return (
-        ("generate_content_free_tier_requests" in lower and "limit: 0" in lower)
-        or "per_day" in lower
-        or "requestsperday" in lower
+        "402" in lower
+        or "insufficient credits" in lower
+        or "exceeded your" in lower
+        or "quota" in lower
+        or "per-day" in lower
+        or "per day" in lower
         or "daily" in lower
-        or "quota exceeded" in lower
     )
 
 def is_rate_limit_error(msg: str) -> bool:
-    """rate limit ต่อนาที หรือ Token ต่อนาทีเต็มชั่วคราว (มีเวลานับถอยหลังให้รอ)"""
+    """rate limit ชั่วคราว (รอแป๊บแล้วลองใหม่ได้)"""
     lower = msg.lower()
-
-    if "please retry in" in lower:
-        return True
-
     return (
-        "per_minute" in lower
-        or "perminute" in lower
-        or "input_token_count" in lower
-        or "429" in lower
+        "429" in lower
+        or "rate limit" in lower
+        or "rate-limited" in lower
+        or "too many requests" in lower
     )
 # ============================
 
@@ -226,40 +286,14 @@ def trim_history(history: list):
         del history[: len(history) - max_messages]
 
     def total_chars(h):
-        total = 0
-        for m in h:
-            for p in m.get("parts", []):
-                total += len(p.get("text", ""))
-        return total
+        return sum(len(m.get("content", "")) for m in h)
 
     while history and total_chars(history) > MAX_HISTORY_CHARS:
         del history[0]
 
 def count_tokens(text: str) -> int:
-    # ภาษาไทยกิน token เยอะกว่าอังกฤษ (~2-3 เท่า) ในระบบ tokenizer ของ Gemini
+    # ภาษาไทยกิน token เยอะกว่าอังกฤษ (~2-3 เท่า) ในระบบ tokenizer ทั่วไปรวมถึง Llama
     return int(len(text) * 0.7) if any(ord(char) > 127 for char in text) else len(text) // 4
-
-SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-
-async def fetch_image_bytes(url: str) -> tuple[bytes, str] | None:
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    return None
-                ct = resp.content_type.split(";")[0].strip()
-                if ct not in SUPPORTED_IMAGE_TYPES:
-                    return None
-                return await resp.read(), ct
-    except Exception as e:
-        print(f"[IMG FETCH ERROR] {e}", flush=True)
-        return None
-
-def build_contents_with_images(text: str, image_parts: list) -> list:
-    parts = [types.Part.from_bytes(data=b, mime_type=m) for b, m in image_parts]
-    if text:
-        parts.append(types.Part.from_text(text=text))
-    return [types.Content(role="user", parts=parts)]
 
 async def _keep_typing(channel):
     try:
@@ -276,16 +310,14 @@ async def summarize_if_too_long(text: str) -> str:
         return text
     print(f"[SUMMARIZE] ยาว {len(text)} ตัว → สรุป", flush=True)
     try:
-        resp = await asyncio.to_thread(
-            get_genai_client().models.generate_content,
-            model=MODEL_NAME,
-            contents=f"สรุปข้อความนี้ให้กระชับไม่เกิน 1800 ตัวอักษร:\n\n{text}",
-            config=types.GenerateContentConfig(
-                system_instruction=SUMMARIZE_PROMPT,
-                max_output_tokens=600,
-            ),
+        reply = await call_openrouter(
+            messages=[
+                {"role": "system", "content": SUMMARIZE_PROMPT},
+                {"role": "user", "content": f"สรุปข้อความนี้ให้กระชับไม่เกิน 1800 ตัวอักษร:\n\n{text}"},
+            ],
+            max_tokens=600,
         )
-        return resp.text.strip() or text[:MAX_REPLY_LENGTH] + "..."
+        return reply.strip() or text[:MAX_REPLY_LENGTH] + "..."
     except Exception as e:
         print(f"[SUMMARIZE ERROR] {e}", flush=True)
         return text[:MAX_REPLY_LENGTH] + "..."
@@ -305,35 +337,24 @@ async def process_message(message, user_input):
     await update_bot_status("playing")
     try:
         history = get_history(message.author.id)
-        image_parts = []
-        for att in message.attachments:
-            result = await fetch_image_bytes(att.url)
-            if result:
-                image_parts.append(result)
-                print(f"[IMG] {att.filename}", flush=True)
-        has_images = bool(image_parts)
-        if not has_images:
-            history.append({"role": "user", "parts": [{"text": user_input}]})
+
+        # โมเดลนี้ดูรูปไม่ได้ (text-only) แจ้งผู้ใช้น่ารักๆ ถ้ามีแนบไฟล์รูปมา
+        has_images = bool(message.attachments) and not SUPPORTS_VISION
+        if has_images and not user_input:
+            user_input = "(ผู้ใช้ส่งรูปภาพมาแต่ไม่มีข้อความ)"
+
+        history.append({"role": "user", "content": user_input})
         try:
             print("[INFO] กำลัง generate...", flush=True)
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+            reply = await call_openrouter(messages=messages, max_tokens=MAX_REPLY_TOKENS)
+
             if has_images:
-                prompt_text = user_input or "ช่วยดูรูปนี้ให้หน่อยนะคะ อธิบายว่าเห็นอะไรบ้าง"
-                contents = build_contents_with_images(prompt_text, image_parts)
-            else:
-                contents = history
-            resp = await asyncio.to_thread(
-                get_genai_client().models.generate_content,
-                model=MODEL_NAME,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    max_output_tokens=MAX_REPLY_TOKENS,
-                ),
-            )
-            reply = resp.text
-            if not has_images:
-                history.append({"role": "model", "parts": [{"text": reply}]})
-                trim_history(history)
+                reply = "อุ๊ย! ตอนนี้ไซยังดูรูปภาพไม่ได้นะคะ 🥲 แต่ไซตอบข้อความที่แนบมาให้ละนะคะ~\n\n" + reply
+
+            history.append({"role": "assistant", "content": reply})
+            trim_history(history)
+
             stats["total_requests"]   += 1
             stats["total_tokens_in"]  += count_tokens(user_input or "")
             stats["total_tokens_out"] += count_tokens(reply)
@@ -343,7 +364,7 @@ async def process_message(message, user_input):
             err_msg = str(e)
             print(f"[ERROR RAW] {err_msg}", flush=True)
             print(f"[ERROR] {err_msg[:300]}", flush=True)
-            if not has_images and history and history[-1]["role"] == "user":
+            if history and history[-1]["role"] == "user":
                 history.pop()
 
             is_daily = is_daily_quota_error(err_msg)
@@ -353,13 +374,13 @@ async def process_message(message, user_input):
             if is_daily:
                 reset_str = get_reset_time_str()
                 await update_bot_status("resting")
-                await message.reply(f"ว้ายยย! โควตารายวันของไซหมดเกลี้ยงแล้วค่ะปะป๋า 💤\nเดี๋ยวไซตื่นใหม่ตอน **{reset_str} น.** นะคะ!")
+                await message.reply(f"ว้ายยย! โควตา/เครดิตของไซหมดเกลี้ยงแล้วค่ะปะป๋า 💤\nลองอีกทีตอน **{reset_str} น.** หรือเช็คเครดิต OpenRouter นะคะ!")
             elif is_rpm:
-                await message.reply("⏳ อูยยย ปะป๋าหรือเพื่อนๆ รัวข้อความ/รูปภาพไวเกินไปจนไซประมวลผลไม่ทันแล้วค่ะ! ขอเวลาหายใจสัก 10-60 วินาทีแล้วลองใหม่นะคะ~ 🥺")
+                await message.reply("⏳ อูยยย ปะป๋าหรือเพื่อนๆ รัวข้อความไวเกินไปจนไซประมวลผลไม่ทันแล้วค่ะ! ขอเวลาหายใจสัก 10-60 วินาทีแล้วลองใหม่นะคะ~ 🥺")
             elif "400" in err_msg:
                 await message.reply("เอ๊ะ? ข้อความนี้ไซรับไม่ได้อ่ะค่ะ ลองเปลี่ยนคำพูดดูใหม่นะคะ 🙏")
-            elif "500" in err_msg or "503" in err_msg or "unavailable" in err_msg.lower():
-                await message.reply("ว้าย! ตอนนี้ฝั่งกูเกิลคนใช้เยอะจนระบบเอ๋อ (503) ค่ะ รอแป๊บนึงแล้วลองใหม่นะคะ 🛠️")
+            elif "500" in err_msg or "502" in err_msg or "503" in err_msg or "unavailable" in err_msg.lower():
+                await message.reply("ว้าย! ตอนนี้โมเดลฝั่ง OpenRouter คนใช้เยอะจนระบบเอ๋อค่ะ รอแป๊บนึงแล้วลองใหม่นะคะ 🛠️")
             else:
                 await message.reply("อุ๊ย! เกิด error แปลกๆ นิดนึงค่ะ ลองใหม่อีกทีนะคะปะป๋า~")
     finally:
@@ -371,22 +392,21 @@ async def process_message(message, user_input):
 
 async def test_key() -> str:
     try:
-        resp = await asyncio.to_thread(
-            get_genai_client().models.generate_content,
-            model=MODEL_NAME,
-            contents="ping",
+        reply = await call_openrouter(
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=10,
         )
-        _ = resp.text
+        _ = reply
         return "✅ ใช้งานได้ปกติค่ะ"
     except Exception as e:
         err = str(e)
         print(f"[TESTKEY ERROR RAW] {err}", flush=True)
         if is_daily_quota_error(err):
-            return f"⚠️ quota วันนี้หมดแล้วค่ะ: `{err[:150]}`"
+            return f"⚠️ โควตา/เครดิตหมดแล้วค่ะ: `{err[:150]}`"
         if is_rate_limit_error(err):
             return f"⏳ rate limit ชั่วคราว (key ยังใช้ได้): `{err[:150]}`"
-        if "503" in err or "unavailable" in err.lower():
-            return "🛠️ ระบบกูเกิลขัดข้องชั่วคราว (503 High Demand) แต่ตัว Key ปกติดีอยู่ค่ะ"
+        if "502" in err or "503" in err or "unavailable" in err.lower():
+            return "🛠️ ระบบ OpenRouter ขัดข้องชั่วคราวค่ะ แต่ตัว Key ปกติดีอยู่ค่ะ"
         return f"❌ error: `{err[:150]}`"
 
 async def update_bot_status(status_type: str):
@@ -498,20 +518,20 @@ def home():
     </div>
     <div class="model-card">
         <div class="model-icon">✨</div>
-        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">Google Gemini — Chat + Vision</div></div>
+        <div><div class="model-name">{MODEL_NAME}</div><div class="model-desc">OpenRouter — Chat (text-only)</div></div>
     </div>
     <div class="grid">
-        <div class="card"><div class="card-icon">📨</div><div class="card-label">Requests Today</div><div class="card-value">{stats["total_requests"]}</div><div class="card-sub">จาก 1,500 req/วัน</div></div>
+        <div class="card"><div class="card-icon">📨</div><div class="card-label">Requests Today</div><div class="card-value">{stats["total_requests"]}</div><div class="card-sub">นับเฉพาะ request ที่สำเร็จ</div></div>
         <div class="card"><div class="card-icon">🪙</div><div class="card-label">Tokens Today</div><div class="card-value">{total_tokens:,}</div><div class="card-sub">ประมาณจากความยาวข้อความ</div></div>
         <div class="card"><div class="card-icon">💬</div><div class="card-label">Active Sessions</div><div class="card-value">{len(user_histories)}</div><div class="card-sub">ผู้ใช้ที่มีประวัติแชทอยู่</div></div>
         <div class="card"><div class="card-icon">🔴</div><div class="card-label">Dedup (Redis)</div><div class="card-value" style="font-size:0.95rem;padding-top:4px">{redis_status}</div><div class="card-sub">กัน message ซ้ำข้าม instance</div></div>
     </div>
     <div class="limits-card">
-        <div class="limits-title">✨ Gemini Free Tier</div>
+        <div class="limits-title">✨ OpenRouter Free Model</div>
         <div class="limit-row"><span class="limit-label">Model</span><span class="limit-val">{MODEL_NAME}</span></div>
-        <div class="limit-row"><span class="limit-label">Requests / วัน</span><span class="limit-val">1,500 RPD</span></div>
-        <div class="limit-row"><span class="limit-label">Requests / นาที</span><span class="limit-val">12 RPM (ตัดหน้า) / 15 RPM (กูเกิล)</span></div>
-        <div class="limit-row"><span class="limit-label">Vision (อ่านรูป)</span><span class="limit-val">✅ รองรับ</span></div>
+        <div class="limit-row"><span class="limit-label">Requests / นาที</span><span class="limit-val">10 (ตัดหน้า) / ~20 (OpenRouter)</span></div>
+        <div class="limit-row"><span class="limit-label">Requests / วัน</span><span class="limit-val">ขึ้นกับเครดิตบัญชี OpenRouter</span></div>
+        <div class="limit-row"><span class="limit-label">Vision (อ่านรูป)</span><span class="limit-val">❌ ยังไม่รองรับ</span></div>
         <div class="limit-row"><span class="limit-label">รีเซต stats อัตโนมัติ</span><span class="limit-val reset-badge">ทุกวัน 07:00 น. (UTC+7)</span></div>
     </div>
     <div class="footer">รีเฟรชอัตโนมัติทุก 30 วินาที • เวลาทั้งหมดเป็น UTC+7</div>
@@ -542,7 +562,7 @@ async def on_ready():
     _bot_ready_time = time.time()
     print("✅ พร้อมรับ message แล้ว!", flush=True)
     await update_bot_status("ready")
-    
+
     # รันลูปเบื้องหลังเฉพาะตอนเปิดบอทครั้งแรกเท่านั้น (กันทำงานซ้ำตอนเน็ตหลุด/Reconnect)
     if not _tasks_started:
         client.loop.create_task(reset_daily_stats())
